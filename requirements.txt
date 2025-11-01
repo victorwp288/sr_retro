@@ -1,0 +1,12 @@
+torch
+torchvision
+Pillow
+numpy
+pyyaml
+tqdm
+scikit-image
+lpips
+opencv-python-headless
+torchmetrics
+# optional for scripts/fetch_hf_edsr_base_x2.py
+super-image
