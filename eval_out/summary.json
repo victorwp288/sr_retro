@@ -1,0 +1,40 @@
+{
+  "models": [
+    {
+      "label": "base_x2",
+      "psnr": 25.553325,
+      "ssim": 0.85497,
+      "count": 97
+    },
+    {
+      "label": "tail_x2",
+      "psnr": 25.907998,
+      "ssim": 0.908519,
+      "count": 97
+    },
+    {
+      "label": "trunk_x2",
+      "psnr": 28.178136,
+      "ssim": 0.940923,
+      "count": 97
+    },
+    {
+      "label": "base_x4_twopass",
+      "psnr": 20.626668,
+      "ssim": 0.623467,
+      "count": 97
+    },
+    {
+      "label": "tail_x4",
+      "psnr": 21.546408,
+      "ssim": 0.772954,
+      "count": 97
+    },
+    {
+      "label": "trunk_x4",
+      "psnr": 21.934915,
+      "ssim": 0.781863,
+      "count": 97
+    }
+  ]
+}

@@ -1,0 +1,51 @@
+model:
+  scale: 4
+  n_feats: 64
+  n_resblocks: 16
+  res_scale: 0.1
+
+training:
+  steps: 200000
+  batch_size: 32
+  val_every: 1000
+  amp: true
+  compile: true
+  tail_only: false
+  warmup_steps: 0
+  warmup_start_factor: 0.001
+
+optimizer:
+  type: adam
+  lr_tail: 0.000020
+  lr_trunk: 0.000050
+  weight_decay: 0.000000
+
+degradations:
+  nearest_prob: 0.000
+  box_prob: 0.000
+  bilinear_prob: 1.000
+  tiny_blur_prob: 0.000
+  jpeg_prob: 0.000
+  jpeg_quality_min: 60
+  jpeg_quality_max: 95
+
+data:
+  root: data
+  auto_split_seed: 42
+  auto_split_ratio: { train: 0.8, val: 0.1, test: 0.1 }
+  patch_size_hr: 128
+  val_patch_size_hr: null
+  crops_tile_aligned_prob: 0.6
+  flips: true
+  rotations: true
+  val_batch_size: 1
+  train_workers: 12
+  val_workers: 4
+  prefetch_factor: 4
+  val_prefetch_factor: 2
+  persistent_workers: true
+  val_persistent_workers: true
+
+pretrained_path: pretrained/edsr_base_x4.pt
+output_dir: runs/edsr_x4_trunk
+seed: 42

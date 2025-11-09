@@ -14,3 +14,6 @@ data/cache/
 *.ckpt
 *.pt
 *.pth
+.serena
+
+.ruff_cache/

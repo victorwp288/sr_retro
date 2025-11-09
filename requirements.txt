@@ -8,5 +8,6 @@ scikit-image
 lpips
 opencv-python-headless
 torchmetrics
+matplotlib
 # optional for scripts/fetch_hf_edsr_base_x2.py
 super-image
