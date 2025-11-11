@@ -13,6 +13,8 @@ training:
   tail_only: false
   warmup_steps: 0
   warmup_start_factor: 0.001
+  early_stop_patience: 30
+  early_stop_min_delta: 0.01
 
 optimizer:
   type: adam
@@ -20,20 +22,37 @@ optimizer:
   lr_trunk: 0.000050
   weight_decay: 0.000000
 
+loss:
+  charbonnier_weight: 1.0
+  charbonnier_eps: 0.001
+  l1_weight: 0.1
+  grad_weight: 0.05
+  lpips_weight: 0.0
+  lpips_net: alex
+
 degradations:
-  nearest_prob: 0.000
-  box_prob: 0.000
-  bilinear_prob: 1.000
-  tiny_blur_prob: 0.000
-  jpeg_prob: 0.000
+  nearest_prob: 0.45
+  box_prob: 0.25
+  bilinear_prob: 0.30
+  tiny_blur_prob: 0.25
+  jpeg_prob: 0.50
   jpeg_quality_min: 60
   jpeg_quality_max: 95
+  palette_jitter_prob: 0.60
+  palette_jitter_std: 0.04
+  channel_drop_prob: 0.10
+  gaussian_noise_prob: 0.50
+  gaussian_noise_std: 0.01
 
 data:
   root: data
   auto_split_seed: 42
   auto_split_ratio: { train: 0.8, val: 0.1, test: 0.1 }
   patch_size_hr: 128
+  patch_schedule:
+    - { step: 0, size: 64 }
+    - { step: 60000, size: 96 }
+    - { step: 120000, size: 128 }
   val_patch_size_hr: null
   crops_tile_aligned_prob: 0.6
   flips: true
@@ -41,7 +60,7 @@ data:
   val_batch_size: 1
   train_workers: 12
   val_workers: 4
-  prefetch_factor: 4
+  prefetch_factor: 6
   val_prefetch_factor: 2
   persistent_workers: true
   val_persistent_workers: true

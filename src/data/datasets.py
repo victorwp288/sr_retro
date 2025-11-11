@@ -49,12 +49,14 @@ class PixelArtDataset(Dataset):
         rotations,
         augment=True,
         cache_images=True,
+        patch_size_ref=None,
     ):
         if not paths:
             raise RuntimeError("dataset received empty path list")
         self.paths = paths
         self.scale = scale
         self.patch_size_hr = patch_size_hr
+        self.patch_size_ref = patch_size_ref
         self.degradation_config = degradation_config
         self.crops_tile_aligned_prob = crops_tile_aligned_prob
         self.flips = flips
@@ -74,12 +76,17 @@ class PixelArtDataset(Dataset):
             hr = load_image(self.paths[index])
         rng = self._resolve_rng()
         tile_aligned = rng.random() < self.crops_tile_aligned_prob
-        hr = choose_hr_crop(hr, self.patch_size_hr, self.scale, tile_aligned, rng)
+        hr = choose_hr_crop(hr, self._current_patch_size(), self.scale, tile_aligned, rng)
         if self.augment:
             hr = apply_augment(hr, self.flips, self.rotations, rng)
         lr_tensor = downscale_with_profile(hr, self.scale, self.degradation_config, rng)
         hr_tensor = tensor_from_pil(hr)
         return lr_tensor, hr_tensor
+
+    def _current_patch_size(self):
+        if self.patch_size_ref is not None:
+            return int(self.patch_size_ref.value)
+        return self.patch_size_hr
 
     def _resolve_rng(self):
         worker_info = torch.utils.data.get_worker_info()

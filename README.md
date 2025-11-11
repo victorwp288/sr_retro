@@ -21,19 +21,47 @@ Retro Pixel Super Resolution is a small, practical training stack for super‑re
    ```bash
    python scripts/fetch_hf_edsr_base_x2.py --output pretrained/edsr_base_x2.pt
    ```
-3. Train x2 first, then train x4 reusing the x2 trunk. Invoke the CLIs as modules so the `src` package is on the import path.
-   ```bash
-   python -m src.train --config configs/edsr_64x16_x2.yaml
-   python -m src.train --config configs/edsr_64x16_x4.yaml
-   ```
+3. Train ×2 tail → ×2 trunk → ×4 tail → ×4 trunk (see “Recommended Workflow” below for the exact commands). Always invoke the CLIs as modules so `src` stays on the import path.
+
+## Recommended Workflow
+
+The current recipe adds dynamic patch schedules, Charbonnier/L1/gradient losses, richer degradations, and automatic early stopping. Run the stages below in order (resume with `--resume_from …/last.pth` only if a job stops mid-way):
+
+```bash
+# Optional: confirm the dataloader settings on your machine
+python -m scripts.benchmark_loader --config configs/edsr_64x16_x2_tail.yaml --steps 400 --warmup 100
+
+# Stage 1: ×2 tail-only fine-tune (warm-start from HF weights)
+python -m src.train --config configs/edsr_64x16_x2_tail.yaml
+
+# Stage 2: ×2 full trunk
+python -m src.train --config configs/edsr_64x16_x2_trunk.yaml
+
+# Stage 3: ×4 tail-only (loads the finished ×2 trunk)
+python -m src.train --config configs/edsr_64x16_x4_tail.yaml
+
+# Stage 4: ×4 full trunk (loads the ×4 tail checkpoint)
+python -m src.train --config configs/edsr_64x16_x4_trunk.yaml
+
+# Mega evaluation: PSNR/SSIM/L1/LPIPS + example strips for every stage
+python -m src.eval --config configs/edsr_64x16_x4_trunk.yaml \
+  --models tail_x2=runs/edsr_x2/best.pth \
+            trunk_x2=runs/edsr_x2_trunk/best.pth \
+            twopass_x2=twopass:runs/edsr_x2_trunk/best.pth \
+            tail_x4=runs/edsr_x4/best.pth \
+            trunk_x4=runs/edsr_x4_trunk/best.pth \
+  --out eval_out_\$(date +%Y%m%d)_mega
+```
 
 **Resume training** (continues optimizer + AMP scaler and skips warm‑up if resuming past it):
 ```bash
-# Resume x2 from the rolling checkpoint
-python -m src.train --config configs/edsr_64x16_x2.yaml --resume_from runs/edsr_x2/last.pth
+# Resume ×2 tail or trunk
+python -m src.train --config configs/edsr_64x16_x2_tail.yaml --resume_from runs/edsr_x2/last.pth
+python -m src.train --config configs/edsr_64x16_x2_trunk.yaml --resume_from runs/edsr_x2_trunk/last.pth
 
-# Or resume x4
-python -m src.train --config configs/edsr_64x16_x4.yaml --resume_from runs/edsr_x4/last.pth
+# Resume ×4 tail or trunk
+python -m src.train --config configs/edsr_64x16_x4_tail.yaml --resume_from runs/edsr_x4/last.pth
+python -m src.train --config configs/edsr_64x16_x4_trunk.yaml --resume_from runs/edsr_x4_trunk/last.pth
 ```
 Checkpoints are written to `runs/edsr_x{2,4}/` as:
 - `best.pth` — best validation PSNR so far (selection metric is PSNR).
@@ -43,16 +71,7 @@ The dataloader walks `data`, performs deterministic train/val/test auto-splits, 
 
 ## Evaluate
 
-```bash
-# Standard RGB (no crop)
-python -m src.eval --config configs/edsr_64x16_x4.yaml --checkpoint runs/edsr_x4/best.pth --split data --subset test
-
-# SR-style PSNR/SSIM with border crop (set to scale) and Y-channel
-python -m src.eval --config configs/edsr_64x16_x4.yaml --checkpoint runs/edsr_x4/best.pth --split data --subset test --crop_border 4 --y_channel
-
-# Optional LPIPS
-python -m src.eval --config configs/edsr_64x16_x4.yaml --checkpoint runs/edsr_x4/best.pth --split data --subset test --lpips
-```
+`src.eval` now emits PSNR, SSIM, L1, and LPIPS (unless you pass `--no_lpips`) for every checkpoint you list via `--models`. Use the “mega” command above to compare all stages at once, or trim the model list for focused comparisons. Flags such as `--crop`, `--y`, and `--device` still work; LPIPS automatically falls back to RGB tensors even if you evaluate PSNR/SSIM on the Y channel.
 
 ## Configuration
 

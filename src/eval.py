@@ -36,6 +36,8 @@ def parse_args():
     parser.add_argument("--y", action="store_true", help="Evaluate on Y channel.")
     parser.add_argument("--crop", type=int, default=0, help="Border crop in pixels.")
     parser.add_argument("--device", default=None, help="Device override (cpu, cuda, mps, ...).")
+    parser.add_argument("--no_lpips", action="store_true", help="Disable LPIPS metric.")
+    parser.add_argument("--lpips_net", default="alex", help="LPIPS backbone (alex, vgg, squeeze).")
     return parser.parse_args()
 
 
@@ -184,20 +186,46 @@ def compute_ssim(sr, hr):
     return value.item()
 
 
+def compute_l1(sr, hr):
+    return torch.abs(sr - hr).mean().item()
+
+
+def build_lpips(net, device):
+    import lpips
+
+    model = lpips.LPIPS(net=net).to(device)
+    model.eval()
+    for param in model.parameters():
+        param.requires_grad = False
+    return model
+
+
+def compute_lpips(sr, hr, model):
+    if model is None:
+        return None
+    if sr.size(1) != 3 or hr.size(1) != 3:
+        return None
+    sr_lp = sr.mul(2.0).sub(1.0)
+    hr_lp = hr.mul(2.0).sub(1.0)
+    value = model(sr_lp, hr_lp)
+    return value.mean().item()
+
+
 def save_example_strip(path, hr_tensor, lr_tensor, sr_tensor):
     path.parent.mkdir(parents=True, exist_ok=True)
     hr_cpu = hr_tensor.detach().cpu()
     lr_cpu = lr_tensor.detach().cpu()
     sr_cpu = sr_tensor.detach().cpu()
     target_size = hr_cpu.shape[-2:]
-    lr_up = F.interpolate(lr_cpu, size=target_size, mode="bicubic", align_corners=False)
-    strip = torch.cat([hr_cpu, lr_up, sr_cpu], dim=-1)
+    lr_nearest = F.interpolate(lr_cpu, size=target_size, mode="nearest")
+    lr_bicubic = F.interpolate(lr_cpu, size=target_size, mode="bicubic", align_corners=False)
+    strip = torch.cat([hr_cpu, lr_nearest, lr_bicubic, sr_cpu], dim=-1)
     array = strip.squeeze(0).permute(1, 2, 0).clamp(0.0, 1.0).numpy()
     plt.imsave(path.as_posix(), array)
 
 
 def write_metrics_csv(path, rows):
-    fieldnames = ["image", "psnr", "ssim"]
+    fieldnames = ["image", "psnr", "ssim", "l1", "lpips"]
     with path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
@@ -207,6 +235,8 @@ def write_metrics_csv(path, rows):
                     "image": row["image"],
                     "psnr": f"{row['psnr']:.6f}",
                     "ssim": "" if row["ssim"] is None else f"{row['ssim']:.6f}",
+                    "l1": f"{row['l1']:.6f}",
+                    "lpips": "" if row["lpips"] is None else f"{row['lpips']:.6f}",
                 }
             )
 
@@ -214,7 +244,7 @@ def write_metrics_csv(path, rows):
 def write_summary_files(out_dir, summaries):
     summary_csv = out_dir / "summary.csv"
     summary_json = out_dir / "summary.json"
-    fieldnames = ["label", "psnr", "ssim", "count"]
+    fieldnames = ["label", "psnr", "ssim", "l1", "lpips", "count"]
     with summary_csv.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
@@ -225,6 +255,8 @@ def write_summary_files(out_dir, summaries):
                     "label": row["label"],
                     "psnr": f"{row['psnr']:.6f}",
                     "ssim": ssim_str,
+                    "l1": f"{row['l1']:.6f}",
+                    "lpips": "" if math.isnan(row["lpips"]) else f"{row['lpips']:.6f}",
                     "count": row["count"],
                 }
             )
@@ -235,6 +267,8 @@ def write_summary_files(out_dir, summaries):
                 "label": row["label"],
                 "psnr": round(row["psnr"], 6),
                 "ssim": None if math.isnan(row["ssim"]) else round(row["ssim"], 6),
+                "l1": round(row["l1"], 6),
+                "lpips": None if math.isnan(row["lpips"]) else round(row["lpips"], 6),
                 "count": row["count"],
             }
         )
@@ -276,7 +310,7 @@ def make_bar_chart(out_path, summaries, key, title, ylabel):
 
 
 def evaluate_model(label, ckpt_path, model_cfg, degradation_cfg, paths, device,
-                   out_root, use_y, crop_border, dump_count, mode="normal"):
+                   out_root, use_y, crop_border, dump_count, lpips_model, mode="normal"):
 
     # load ckpt/config (unchanged) ...
     state = torch.load(ckpt_path, map_location="cpu")
@@ -298,6 +332,7 @@ def evaluate_model(label, ckpt_path, model_cfg, degradation_cfg, paths, device,
     model_dir.mkdir(parents=True, exist_ok=True)
 
     metrics_rows, psnr_values, ssim_values = [], [], []
+    l1_values, lpips_values = [], []
     net_scale = int(model_cfg_local["scale"])
     if mode == "twopass" and net_scale != 2:
         raise ValueError(f"twopass expects a ×2 model, got ×{net_scale}")
@@ -326,11 +361,16 @@ def evaluate_model(label, ckpt_path, model_cfg, degradation_cfg, paths, device,
 
             p = compute_psnr(sr_metric, hr_metric)
             s = compute_ssim(sr_metric, hr_metric)
+            l1 = compute_l1(sr_metric, hr_metric)
+            lp = compute_lpips(sr_eval, hr_eval, lpips_model)
 
-            metrics_rows.append({"image": str(path), "psnr": p, "ssim": s})
+            metrics_rows.append({"image": str(path), "psnr": p, "ssim": s, "l1": l1, "lpips": lp})
             psnr_values.append(p)
             if s is not None:
                 ssim_values.append(s)
+            l1_values.append(l1)
+            if lp is not None:
+                lpips_values.append(lp)
 
             if idx < dump_count:
                 save_example_strip(model_dir / "examples" / f"{idx:04d}.png", hr_aligned, lr, sr_aligned)
@@ -338,7 +378,9 @@ def evaluate_model(label, ckpt_path, model_cfg, degradation_cfg, paths, device,
     write_metrics_csv(model_dir / "metrics.csv", metrics_rows)
     mean_psnr = sum(psnr_values) / len(psnr_values)
     mean_ssim = float("nan") if not ssim_values else sum(ssim_values) / len(ssim_values)
-    return {"label": label, "psnr": mean_psnr, "ssim": mean_ssim, "count": len(paths)}
+    mean_l1 = sum(l1_values) / len(l1_values)
+    mean_lpips = float("nan") if not lpips_values else sum(lpips_values) / len(lpips_values)
+    return {"label": label, "psnr": mean_psnr, "ssim": mean_ssim, "l1": mean_l1, "lpips": mean_lpips, "count": len(paths)}
 
 def main():
     args = parse_args()
@@ -352,6 +394,7 @@ def main():
     out_root = Path(args.out)
     out_root.mkdir(parents=True, exist_ok=True)
     model_specs = parse_model_specs(args.models)
+    lpips_model = None if args.no_lpips else build_lpips(args.lpips_net, device)
     summaries = []
     for label, ckpt_path, mode in model_specs:
         summary = evaluate_model(
@@ -365,12 +408,15 @@ def main():
             use_y=args.y,
             crop_border=crop_border,
             dump_count=dump_count,
+            lpips_model=lpips_model,
             mode=mode,   # <- add this
         )
         summaries.append(summary)
     write_summary_files(out_root, summaries)
     make_bar_chart(out_root / "bar_psnr.png", summaries, "psnr", "PSNR", "PSNR (dB)")
     make_bar_chart(out_root / "bar_ssim.png", summaries, "ssim", "SSIM", "SSIM")
+    make_bar_chart(out_root / "bar_l1.png", summaries, "l1", "L1", "L1 (lower better)")
+    make_bar_chart(out_root / "bar_lpips.png", summaries, "lpips", "LPIPS", "LPIPS (lower better)")
 
 
 if __name__ == "__main__":

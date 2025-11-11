@@ -2,6 +2,7 @@ import argparse
 import inspect
 import random
 from contextlib import nullcontext
+from multiprocessing import Manager
 from pathlib import Path
 
 import numpy as np
@@ -104,6 +105,107 @@ def _extract_adapted_weights(state_dict, model_state, allow_tail=True):
     return adapted, matched_tail
 
 
+def _to_y(t):
+    if t.size(1) == 1:
+        return t
+    if t.size(1) != 3:
+        raise ValueError(f"Expected 1 or 3 channels, got {t.size(1)}")
+    r = t[:, 0:1]
+    g = t[:, 1:2]
+    b = t[:, 2:3]
+    return 0.257 * r + 0.504 * g + 0.098 * b + 16.0 / 255.0
+
+
+def charbonnier_loss(sr, hr, eps):
+    diff = sr - hr
+    return torch.sqrt(diff * diff + eps * eps).mean()
+
+
+def gradient_loss(sr, hr, kernel_x, kernel_y):
+    sr_y = _to_y(sr)
+    hr_y = _to_y(hr)
+    kernel_x = kernel_x.to(sr_y.dtype)
+    kernel_y = kernel_y.to(sr_y.dtype)
+    grad_sr_x = F.conv2d(sr_y, kernel_x, padding=1)
+    grad_hr_x = F.conv2d(hr_y, kernel_x, padding=1)
+    grad_sr_y = F.conv2d(sr_y, kernel_y, padding=1)
+    grad_hr_y = F.conv2d(hr_y, kernel_y, padding=1)
+    diff_x = torch.abs(grad_sr_x - grad_hr_x).mean()
+    diff_y = torch.abs(grad_sr_y - grad_hr_y).mean()
+    return diff_x + diff_y
+
+
+def build_loss_fn(config, device):
+    loss_cfg = config.get("loss", {})
+    weights = {
+        "charbonnier": float(loss_cfg.get("charbonnier_weight", 0.0)),
+        "l1": float(loss_cfg.get("l1_weight", 0.0)),
+        "grad": float(loss_cfg.get("grad_weight", 0.0)),
+        "lpips": float(loss_cfg.get("lpips_weight", 0.0)),
+    }
+    eps = float(loss_cfg.get("charbonnier_eps", 1e-3))
+    lpips_model = None
+    grad_kernel_x = None
+    grad_kernel_y = None
+    if weights["grad"] > 0.0:
+        base = torch.tensor(
+            [[1.0, 0.0, -1.0], [2.0, 0.0, -2.0], [1.0, 0.0, -1.0]],
+            dtype=torch.float32,
+            device=device,
+        ).view(1, 1, 3, 3)
+        grad_kernel_x = base
+        grad_kernel_y = base.transpose(2, 3)
+    if weights["lpips"] > 0.0:
+        import lpips
+
+        lpips_model = lpips.LPIPS(net=loss_cfg.get("lpips_net", "alex")).to(device)
+        lpips_model.eval()
+        for param in lpips_model.parameters():
+            param.requires_grad = False
+
+    if not any(weights.values()):
+        return lambda sr, hr: F.mse_loss(sr, hr)
+
+    def compute(sr, hr):
+        total = 0.0
+        if weights["charbonnier"] > 0.0:
+            total += weights["charbonnier"] * charbonnier_loss(sr, hr, eps)
+        if weights["l1"] > 0.0:
+            total += weights["l1"] * torch.abs(sr - hr).mean()
+        if weights["grad"] > 0.0:
+            total += weights["grad"] * gradient_loss(sr, hr, grad_kernel_x, grad_kernel_y)
+        if weights["lpips"] > 0.0 and lpips_model is not None:
+            sr_lp = sr.float().mul(2.0).sub(1.0)
+            hr_lp = hr.float().mul(2.0).sub(1.0)
+            lpips_value = lpips_model(sr_lp, hr_lp).mean()
+            total += weights["lpips"] * lpips_value
+        return total
+
+    return compute
+
+
+def _build_patch_schedule(data_cfg):
+    raw = data_cfg.get("patch_schedule") or []
+    entries = []
+    for item in raw:
+        step = int(item.get("step", 0))
+        size = int(item.get("size", 0))
+        if step < 0 or size <= 0:
+            continue
+        entries.append((step, size))
+    entries.sort(key=lambda pair: pair[0])
+    return entries
+
+
+def _patch_index_for_step(step, schedule):
+    idx = 0
+    for i, (boundary, _) in enumerate(schedule):
+        if step >= boundary:
+            idx = i
+        else:
+            break
+    return idx
+
 
 def pick_device(preferred=None):
     if preferred:
@@ -136,6 +238,8 @@ def main():
 
     training_cfg = config["training"]
     tail_only = bool(training_cfg.get("tail_only", True))
+    early_stop_patience = int(training_cfg.get("early_stop_patience", 0) or 0)
+    early_stop_min_delta = float(training_cfg.get("early_stop_min_delta", 0.0))
     seed = config.get("seed", 42)
     set_seed(seed)
     if torch.cuda.is_available():
@@ -155,6 +259,13 @@ def main():
     degradation_cfg = DegradationConfig(**config["degradations"])
 
     data_cfg = config["data"]
+    patch_schedule = _build_patch_schedule(data_cfg)
+    patch_ref = None
+    patch_cursor = 0
+    patch_manager = None
+    if patch_schedule:
+        patch_manager = Manager()
+        patch_ref = patch_manager.Value("i", patch_schedule[0][1])
 
     auto_root = data_cfg.get("root")
     ratios = data_cfg.get("auto_split_ratio", {"train": 0.8, "val": 0.1, "test": 0.1})
@@ -184,6 +295,7 @@ def main():
         rotations=data_cfg["rotations"],
         augment=True,
         cache_images=cache_images,
+        patch_size_ref=patch_ref,
     )
     val_dataset = PixelArtDataset(
         paths=val_paths,
@@ -198,6 +310,8 @@ def main():
     )
 
     pin_memory = device.type == "cuda"
+
+    loss_fn = build_loss_fn(config, device)
 
     train_workers = data_cfg.get("train_workers", 4)
     val_workers = data_cfg.get("val_workers", 2)
@@ -247,10 +361,14 @@ def main():
         model_state.update(adapted)
         model.load_state_dict(model_state, strict=True)
         start_step = int(resume_state.get("step", 0))
-        start_step = int(resume_state.get("step", 0))
+
+    if patch_ref is not None and patch_schedule:
+        patch_cursor = _patch_index_for_step(start_step, patch_schedule)
+        patch_ref.value = patch_schedule[patch_cursor][1]
 
     # Decide whether to inherit best_psnr from the checkpoint
     best_psnr = None
+    epochs_since_improve = 0
     if resume_state and "best_psnr" in resume_state:
         resume_cfg = resume_state.get("config", {})
         same_scale = resume_cfg.get("model", {}).get("scale") == config["model"]["scale"]
@@ -263,6 +381,7 @@ def main():
 
         if same_scale and same_crop and same_ychan and same_out:
             best_psnr = float(resume_state["best_psnr"])
+            epochs_since_improve = int(resume_state.get("epochs_since_improve", 0))
             print(f"[resume] inheriting best_psnr={best_psnr:.4f}")
         else:
             print("[resume] resetting best_psnr for new run/config (scale/eval/output changed).")
@@ -409,78 +528,101 @@ def main():
     resume_step = start_step
     resuming = resume_state is not None
 
-    model.train()
-    train_iter = iter(train_loader)
-    progress = tqdm(range(start_step + 1, total_steps + 1), initial=start_step, total=total_steps)
-    for step in progress:
-        try:
-            lr_batch, hr_batch = next(train_iter)
-        except StopIteration:
-            train_iter = iter(train_loader)
-            lr_batch, hr_batch = next(train_iter)
+    try:
+        model.train()
+        train_iter = iter(train_loader)
+        progress = tqdm(range(start_step + 1, total_steps + 1), initial=start_step, total=total_steps)
+        for step in progress:
+            if patch_ref is not None and patch_schedule:
+                while patch_cursor + 1 < len(patch_schedule) and step >= patch_schedule[patch_cursor + 1][0]:
+                    patch_cursor += 1
+                    new_patch = patch_schedule[patch_cursor][1]
+                    patch_ref.value = new_patch
+                    print(f"[patch] step {step} patch_size={new_patch}")
+            try:
+                lr_batch, hr_batch = next(train_iter)
+            except StopIteration:
+                train_iter = iter(train_loader)
+                lr_batch, hr_batch = next(train_iter)
 
-        lr_batch = lr_batch.to(device, non_blocking=True)
-        hr_batch = hr_batch.to(device, non_blocking=True)
+            lr_batch = lr_batch.to(device, non_blocking=True)
+            hr_batch = hr_batch.to(device, non_blocking=True)
 
-        optimizer.zero_grad(set_to_none=True)
+            optimizer.zero_grad(set_to_none=True)
 
-        # Apply warmup only if not resuming past warmup. If we resumed during warmup,
-        # continue from the current step; otherwise preserve checkpoint LRs.
-        in_warmup = warmup_steps > 0 and step <= warmup_steps
-        resuming_past_warmup = resuming and (resume_step >= warmup_steps)
+            # Apply warmup only if not resuming past warmup. If we resumed during warmup,
+            # continue from the current step; otherwise preserve checkpoint LRs.
+            in_warmup = warmup_steps > 0 and step <= warmup_steps
+            resuming_past_warmup = resuming and (resume_step >= warmup_steps)
 
-        if in_warmup and not resuming_past_warmup:
-            progress_frac = step / warmup_steps
-            factor = warmup_start_factor + (1.0 - warmup_start_factor) * progress_frac
-            for lr, group in zip(base_lrs, optimizer.param_groups):
-                group["lr"] = lr * factor
-        elif warmup_steps > 0 and step == warmup_steps + 1 and not resuming_past_warmup:
-            # Ensure exact base LR at the first step after warmup (only when not resuming past warmup)
-            for lr, group in zip(base_lrs, optimizer.param_groups):
-                group["lr"] = lr
-        
-        if amp_enabled:
-            with autocast_context():
-                sr_batch = model(lr_batch)
-                loss = F.mse_loss(sr_batch, hr_batch)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            sr_batch = model(lr_batch)
-            loss = F.mse_loss(sr_batch, hr_batch)
-            loss.backward()
-            optimizer.step()
+            if in_warmup and not resuming_past_warmup:
+                progress_frac = step / warmup_steps
+                factor = warmup_start_factor + (1.0 - warmup_start_factor) * progress_frac
+                for lr, group in zip(base_lrs, optimizer.param_groups):
+                    group["lr"] = lr * factor
+            elif warmup_steps > 0 and step == warmup_steps + 1 and not resuming_past_warmup:
+                # Ensure exact base LR at the first step after warmup (only when not resuming past warmup)
+                for lr, group in zip(base_lrs, optimizer.param_groups):
+                    group["lr"] = lr
 
-        if step % 50 == 0 or step == 1:
-            progress.set_description(f"step {step} loss {loss.item():.4f}")
-
-        if step % training_cfg["val_every"] == 0 or step == total_steps:
-            val_l1, val_psnr, val_ssim = validate(model, val_loader, device, config)
-            print(f"validation mean L1: {val_l1:.6f} | PSNR: {val_psnr:.4f} | SSIM: {val_ssim:.4f}")
-
-            improved = best_psnr is None or val_psnr > best_psnr
-            if improved:
-                best_psnr = val_psnr
-
-            base_model = model._orig_mod if hasattr(model, "_orig_mod") else model
-            to_save = {
-                "model": base_model.state_dict(),  # save unwrapped module
-                "optimizer": optimizer.state_dict(),
-                "step": step,
-                "best_psnr": best_psnr,
-                "config": config,
-            }
             if amp_enabled:
-                to_save["scaler"] = scaler.state_dict()
+                with autocast_context():
+                    sr_batch = model(lr_batch)
+                    loss = loss_fn(sr_batch, hr_batch)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                sr_batch = model(lr_batch)
+                loss = loss_fn(sr_batch, hr_batch)
+                loss.backward()
+                optimizer.step()
 
-            # always write rolling last
-            last_path = output_dir / "last.pth"
-            torch.save(to_save, last_path)
+            if step % 50 == 0 or step == 1:
+                progress.set_description(f"step {step} loss {loss.item():.4f}")
 
-            if improved:
-                torch.save(to_save, best_path)
-                print(f"saved best PSNR: {val_psnr:.4f} → {best_path}")
+            if step % training_cfg["val_every"] == 0 or step == total_steps:
+                val_l1, val_psnr, val_ssim = validate(model, val_loader, device, config)
+                print(f"validation mean L1: {val_l1:.6f} | PSNR: {val_psnr:.4f} | SSIM: {val_ssim:.4f}")
+
+                improved = best_psnr is None or val_psnr > best_psnr + early_stop_min_delta
+                if improved:
+                    best_psnr = val_psnr
+                    epochs_since_improve = 0
+                else:
+                    epochs_since_improve += 1
+
+                base_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+                to_save = {
+                    "model": base_model.state_dict(),  # save unwrapped module
+                    "optimizer": optimizer.state_dict(),
+                    "step": step,
+                    "best_psnr": best_psnr,
+                    "epochs_since_improve": epochs_since_improve,
+                    "config": config,
+                }
+                if amp_enabled:
+                    to_save["scaler"] = scaler.state_dict()
+
+                # always write rolling last
+                last_path = output_dir / "last.pth"
+                torch.save(to_save, last_path)
+
+                if improved:
+                    torch.save(to_save, best_path)
+                    print(f"saved best PSNR: {val_psnr:.4f} → {best_path}")
+
+                if early_stop_patience > 0 and epochs_since_improve >= early_stop_patience:
+                    print(
+                        f"[early_stop] no PSNR improvement for {epochs_since_improve} validation runs, stopping at step {step}"
+                    )
+                    break
+    finally:
+        if patch_manager is not None:
+            try:
+                patch_manager.shutdown()
+            except Exception as exc:
+                print(f"warning: could not shutdown patch manager: {exc}")
 
 def _align_spatial_dims(sr_batch, hr_batch):
     # Ensure tensors share the same spatial extent before computing the loss.
@@ -497,13 +639,6 @@ def _align_spatial_dims(sr_batch, hr_batch):
     if hr_h != target_h or hr_w != target_w:
         hr_batch = hr_batch[..., :target_h, :target_w]
     return sr_batch, hr_batch
-
-
-def _to_y(t):
-    if t.size(1) == 1:
-        return t
-    r, g, b = t[:, 0:1], t[:, 1:2], t[:, 2:3]
-    return 0.257 * r + 0.504 * g + 0.098 * b + 16.0 / 255.0
 
 
 def validate(model, loader, device, config):
