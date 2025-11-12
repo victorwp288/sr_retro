@@ -1,8 +1,10 @@
 import argparse
 import csv
+import inspect
 import json
 import math
 import random
+import warnings
 from pathlib import Path
 import matplotlib
 matplotlib.use("Agg")
@@ -10,11 +12,21 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 import yaml
-from torchmetrics.functional import peak_signal_noise_ratio, structural_similarity_index_measure
+from torchmetrics.image import peak_signal_noise_ratio, structural_similarity_index_measure
 
 from src.data.degradations import DegradationConfig, downscale_with_profile
 from src.data.utils import load_image, tensor_from_pil, resolve_paths_from_source
 from src.models import EDSR
+
+
+_TORCH_LOAD_SUPPORTS_WEIGHTS_ONLY = "weights_only" in inspect.signature(torch.load).parameters
+
+
+def _safe_torch_load(path):
+    kwargs = {"map_location": "cpu"}
+    if _TORCH_LOAD_SUPPORTS_WEIGHTS_ONLY:
+        kwargs["weights_only"] = True
+    return torch.load(path, **kwargs)
 
 
 def pick_device(preferred=None):
@@ -110,7 +122,7 @@ def build_model(model_cfg, device):
 
 
 def load_checkpoint(model, ckpt_path):
-    state = torch.load(ckpt_path, map_location="cpu")
+    state = _safe_torch_load(ckpt_path)
     state_dict = _select_state_dict(state)
     if hasattr(state_dict, "items"):
         cleaned = {}
@@ -313,7 +325,7 @@ def evaluate_model(label, ckpt_path, model_cfg, degradation_cfg, paths, device,
                    out_root, use_y, crop_border, dump_count, lpips_model, mode="normal"):
 
     # load ckpt/config (unchanged) ...
-    state = torch.load(ckpt_path, map_location="cpu")
+    state = _safe_torch_load(ckpt_path)
     ckpt_model_cfg = None
     if isinstance(state, dict):
         cfg = state.get("config")

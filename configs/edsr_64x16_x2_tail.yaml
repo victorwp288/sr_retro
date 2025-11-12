@@ -13,8 +13,8 @@ training:
   tail_only: true
   warmup_steps: 1000
   warmup_start_factor: 0.001
-  early_stop_patience: 30
-  early_stop_min_delta: 0.01
+  early_stop_patience: 80
+  early_stop_min_delta: 0.005
 
 optimizer:
   type: adam

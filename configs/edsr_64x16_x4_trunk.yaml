@@ -14,7 +14,7 @@ training:
   warmup_steps: 0
   warmup_start_factor: 0.001
   early_stop_patience: 40
-  early_stop_min_delta: 0.01
+  early_stop_min_delta: 0.005
 
 optimizer:
   type: adam

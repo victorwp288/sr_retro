@@ -1,0 +1,150 @@
+image,psnr,ssim
+data/raw/109.png,21.931398,0.896891
+data/raw/118.png,23.618330,0.913933
+data/raw/143.png,26.588408,0.935919
+data/raw/146.png,23.547026,0.897714
+data/raw/152.png,25.041344,0.910200
+data/raw/156.png,22.740812,0.917353
+data/raw/176.png,24.043447,0.912441
+data/raw/180.png,22.462568,0.894088
+data/raw/183.png,21.081751,0.892351
+data/raw/2.png,16.004034,0.829488
+data/raw/212.png,21.134987,0.882418
+data/raw/217.png,22.688665,0.915448
+data/raw/223.png,22.185034,0.919268
+data/raw/227.png,23.374546,0.932118
+data/raw/240.png,21.697920,0.895019
+data/raw/242.png,22.606445,0.904470
+data/raw/256.png,22.313311,0.869811
+data/raw/263.png,22.275288,0.904190
+data/raw/266.png,22.272800,0.901845
+data/raw/268.png,23.835072,0.921166
+data/raw/274.png,24.715364,0.908927
+data/raw/281.png,25.230707,0.893916
+data/raw/284.png,25.702698,0.909651
+data/raw/298.png,22.809744,0.889937
+data/raw/300.png,24.381910,0.905188
+data/raw/306.png,25.538170,0.892214
+data/raw/325.png,22.951620,0.898722
+data/raw/35.png,22.419086,0.900600
+data/raw/351.png,22.994953,0.894495
+data/raw/358.png,26.564070,0.931300
+data/raw/377.png,23.352936,0.874039
+data/raw/381.png,22.923761,0.919240
+data/raw/389.png,22.279985,0.899677
+data/raw/39.png,23.051762,0.871067
+data/raw/395.png,23.535030,0.927688
+data/raw/396.png,23.593863,0.920398
+data/raw/41.png,22.636755,0.887862
+data/raw/449.png,23.823698,0.928270
+data/raw/461.png,22.341545,0.902133
+data/raw/481.png,22.447531,0.931246
+data/raw/484.png,22.548090,0.925249
+data/raw/487.png,25.075108,0.921994
+data/raw/491.png,21.912867,0.870310
+data/raw/498.png,21.032070,0.911332
+data/raw/5.png,15.654730,0.821564
+data/raw/500.png,22.235304,0.866189
+data/raw/506.png,24.783617,0.920950
+data/raw/514.png,22.503687,0.922805
+data/raw/517.png,22.382378,0.908195
+data/raw/523.png,22.220634,0.919461
+data/raw/546.png,23.441557,0.906654
+data/raw/55.png,22.241714,0.921887
+data/raw/558.png,22.760094,0.911332
+data/raw/58.png,20.883249,0.892160
+data/raw/582.png,22.586493,0.916423
+data/raw/583.png,24.661478,0.883433
+data/raw/587.png,22.466970,0.898804
+data/raw/589.png,22.169832,0.891684
+data/raw/592.png,22.603844,0.904941
+data/raw/601.png,23.289499,0.920275
+data/raw/607.png,21.642744,0.908356
+data/raw/628.png,23.043625,0.908029
+data/raw/635.png,20.321291,0.886930
+data/raw/675.png,23.359215,0.914197
+data/raw/677.png,26.015165,0.918479
+data/raw/693.png,23.359720,0.914046
+data/raw/715.png,22.858797,0.917789
+data/raw/721.png,24.337799,0.899438
+data/raw/729.png,25.123625,0.903292
+data/raw/75.png,21.251871,0.901521
+data/raw/757.png,25.192427,0.935310
+data/raw/761.png,22.603373,0.891572
+data/raw/762.png,24.468534,0.935550
+data/raw/768.png,23.406534,0.891372
+data/raw/778.png,22.034283,0.885453
+data/raw/793.png,22.106649,0.911520
+data/raw/795.png,22.351992,0.885082
+data/raw/796.png,22.672583,0.889179
+data/raw/799.png,27.236031,0.945520
+data/raw/804.png,24.268808,0.894258
+data/raw/824.png,24.374746,0.908894
+data/raw/830.png,25.637409,0.912525
+data/raw/834.png,22.152536,0.898924
+data/raw/869.png,23.301168,0.909489
+data/raw/873.png,24.736090,0.912513
+data/raw/874.png,23.091358,0.902391
+data/raw/885.png,22.562052,0.912028
+data/raw/A4_Walls.png,18.678825,0.562443
+data/raw/Back - Attacking.png,33.713528,0.976531
+data/raw/BayTile_06.png,19.096703,0.584861
+data/raw/BayTile_07.png,19.933769,0.681569
+data/raw/BayTile_13.png,17.171274,0.582035
+data/raw/BayTile_25.png,15.792066,0.803351
+data/raw/Cartoon_Medieval_Glassmaker_Workshop_Level_Set_Building - Decor Roof 02.png,22.267805,0.906869
+data/raw/Cartoon_Medieval_Glassmaker_Workshop_Level_Set_Building - Door 04.png,25.461912,0.895653
+data/raw/Cartoon_Medieval_Glassmaker_Workshop_Level_Set_Building - Roof A 03.png,26.289608,0.917970
+data/raw/Cartoon_Medieval_Glassmaker_Workshop_Level_Set_Building - Stone Window 02.png,20.581364,0.883148
+data/raw/Cartoon_Medieval_Glassmaker_Workshop_Level_Set_Environment - Rock 07.png,20.167200,0.879251
+data/raw/Cartoon_Medieval_Glassmaker_Workshop_Level_Set_Environment - Stall 02.png,25.371212,0.959750
+data/raw/Cartoon_Medieval_Glassmaker_Workshop_Level_Set_Environment - Storage 02.png,23.469549,0.917776
+data/raw/Cartoon_Medieval_Glassmaker_Workshop_Level_Set_Environment - Table 01.png,18.765415,0.878100
+data/raw/Cartoon_Medieval_Glassmaker_Workshop_Level_Set_Environment - Tree 02.png,25.486670,0.967261
+data/raw/Cartoon_Medieval_Glassmaker_Workshop_Level_Set_Platformer - Ground 11.png,30.399385,0.957456
+data/raw/Decorative_cracks.png,25.793665,0.911881
+data/raw/DungeonCrawl_ProjectUtumnoTileset.png,19.532370,0.740430
+data/raw/Food.png,17.484863,0.684136
+data/raw/GX001-3.png,35.420643,0.991480
+data/raw/Left - Running.png,35.347122,0.981754
+data/raw/Right - Idle Blinking.png,35.535736,0.983035
+data/raw/Text2.png,15.528679,0.373590
+data/raw/Tileset-kopi 2.png,18.385557,0.727436
+data/raw/Top-Down Simple Summer_Ground 02.png,35.579975,0.981123
+data/raw/Top-Down Simple Summer_Ground 05.png,32.771622,0.967842
+data/raw/Top-Down Simple Summer_Ground 16.png,34.444336,0.978068
+data/raw/Top-Down Simple Summer_Ground 17.png,37.253723,0.984495
+data/raw/Top-Down Simple Summer_Ground 28.png,33.722630,0.973451
+data/raw/Top-Down Simple Summer_Ground 32.png,34.931782,0.979031
+data/raw/Top-Down Simple Summer_Ground 43.png,44.486172,0.992542
+data/raw/Top-Down Simple Summer_Prop - Castle Round.png,27.539249,0.910224
+data/raw/Top-Down Simple Summer_Prop - Well.png,27.727694,0.888097
+data/raw/Top-Down Simple Summer_Prop - Wooden Barrel.png,25.535629,0.873513
+data/raw/arcade_platformerV2.png,20.000017,0.779684
+data/raw/attackfatmonster.png,32.907906,0.965638
+data/raw/bg_cloud4.png,25.664061,0.910450
+data/raw/bg_cloud5.png,27.356501,0.904263
+data/raw/cape_maroon.png,38.790516,0.982729
+data/raw/cave_tileset.png,22.721617,0.864004
+data/raw/characters.png,18.723213,0.825529
+data/raw/factorytileset.png,21.770144,0.735467
+data/raw/house_inside.png,24.096685,0.848139
+data/raw/image_484.png,28.322144,0.758794
+data/raw/magic_icons.png,21.072151,0.757504
+data/raw/obj_wallshroom.png,21.070911,0.819348
+data/raw/rpgportraits.png,19.097172,0.714780
+data/raw/scifi_platformTiles_32x32.png,34.618580,0.947741
+data/raw/spr_f_arctic_old.png,16.932257,0.734712
+data/raw/spr_m_arctic_spear.png,22.582802,0.880934
+data/raw/tattercape_red.png,44.241753,0.984857
+data/raw/tile_jungle_ground_brown.png,24.557903,0.823656
+data/raw/tile_jungle_tree_light.png,23.982100,0.783523
+data/raw/tile_jungle_wall_brown.png,26.650881,0.862668
+data/raw/tile_village_objects.png,25.575178,0.879198
+data/raw/tiles_jungle_botom_water.png,23.528538,0.769161
+data/raw/tilesetHouse.png,26.167126,0.840961
+data/raw/tileset_1bit.png,8.398901,0.433118
+data/raw/town.png,19.677647,0.729789
+data/raw/treepack.png,21.161188,0.855908
+data/raw/trees.png,18.448500,0.770859
+data/raw/trees_plants_rocks.png,20.074844,0.735145

@@ -13,8 +13,8 @@ training:
   tail_only: false
   warmup_steps: 0
   warmup_start_factor: 0.001
-  early_stop_patience: 30
-  early_stop_min_delta: 0.01
+  early_stop_patience: 150
+  early_stop_min_delta: 0.005
 
 optimizer:
   type: adam
@@ -65,6 +65,6 @@ data:
   persistent_workers: true
   val_persistent_workers: true
 
-pretrained_path: pretrained/edsr_base_x2.pt
+pretrained_path: runs/edsr_x2/best.pth
 output_dir: runs/edsr_x2_trunk
 seed: 42
