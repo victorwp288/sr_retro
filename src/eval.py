@@ -17,9 +17,15 @@ from torchmetrics.image import peak_signal_noise_ratio, structural_similarity_in
 from src.data.degradations import DegradationConfig, downscale_with_profile
 from src.data.utils import load_image, tensor_from_pil, resolve_paths_from_source
 from src.models import EDSR
+from src.losses import to_y as to_y_channel
 
 
 _TORCH_LOAD_SUPPORTS_WEIGHTS_ONLY = "weights_only" in inspect.signature(torch.load).parameters
+_SOBEL_KERNEL_X = torch.tensor(
+    [[1.0, 0.0, -1.0], [2.0, 0.0, -2.0], [1.0, 0.0, -1.0]],
+    dtype=torch.float32,
+).view(1, 1, 3, 3)
+_SOBEL_KERNEL_Y = _SOBEL_KERNEL_X.transpose(2, 3).contiguous()
 
 
 def _safe_torch_load(path):
@@ -67,13 +73,31 @@ def parse_model_specs(items):
         else:
             ckpt = t
             label = Path(ckpt).stem
+        prefixes = []
+        while True:
+            parts = ckpt.split(":", 1)
+            if len(parts) == 1:
+                break
+            prefix, remainder = parts
+            if prefix in {"twopass", "ema", "swa", "raw"}:
+                prefixes.append(prefix)
+                ckpt = remainder
+            else:
+                break
         mode = "normal"
-        if ckpt.startswith("twopass:"):
-            mode = "twopass"
-            ckpt = ckpt[len("twopass:"):]
+        variant = "model"
+        for prefix in prefixes:
+            if prefix == "twopass":
+                mode = "twopass"
+            elif prefix == "ema":
+                variant = "ema"
+            elif prefix == "swa":
+                variant = "swa"
+            elif prefix == "raw":
+                variant = "model"
         if not label:
             label = Path(ckpt).stem
-        specs.append((label, Path(ckpt), mode))
+        specs.append((label, Path(ckpt), mode, variant))
     return specs
 
     
@@ -101,6 +125,77 @@ def _select_state_dict(state):
     return state
 
 
+def _apply_residual_output(sr, lr, scale, enabled):
+    if not enabled or scale <= 1:
+        return sr
+    target_h = lr.shape[-2] * scale
+    target_w = lr.shape[-1] * scale
+    base = F.interpolate(lr, size=(target_h, target_w), mode="nearest")
+    return sr + base
+
+
+def _apply_transform(tensor, transpose, flip_h, flip_v):
+    out = tensor
+    if transpose:
+        out = out.transpose(-2, -1)
+    if flip_h:
+        out = out.flip(-1)
+    if flip_v:
+        out = out.flip(-2)
+    return out
+
+
+def _inverse_transform(tensor, transpose, flip_h, flip_v):
+    out = tensor
+    if flip_v:
+        out = out.flip(-2)
+    if flip_h:
+        out = out.flip(-1)
+    if transpose:
+        out = out.transpose(-2, -1)
+    return out
+
+
+def compute_grad_l1(sr, hr):
+    sr_y = to_y_channel(sr).float()
+    hr_y = to_y_channel(hr).float()
+    kx = _SOBEL_KERNEL_X.to(device=sr_y.device, dtype=torch.float32)
+    ky = _SOBEL_KERNEL_Y.to(device=sr_y.device, dtype=torch.float32)
+    grad_sr_x = F.conv2d(sr_y, kx, padding=1)
+    grad_hr_x = F.conv2d(hr_y, kx, padding=1)
+    grad_sr_y = F.conv2d(sr_y, ky, padding=1)
+    grad_hr_y = F.conv2d(hr_y, ky, padding=1)
+    diff = torch.abs(grad_sr_x - grad_hr_x) + torch.abs(grad_sr_y - grad_hr_y)
+    return diff.mean().item()
+
+
+def run_inference(model, lr, scale, residual_enabled, tta_enabled, mode):
+    def single_pass(inp):
+        out = model(inp)
+        return _apply_residual_output(out, inp, scale, residual_enabled)
+
+    def forward(inp):
+        if mode == "twopass":
+            mid = single_pass(inp).clamp(0.0, 1.0)
+            return single_pass(mid)
+        return single_pass(inp)
+
+    sr = forward(lr)
+    if not tta_enabled:
+        return sr.clamp(0.0, 1.0)
+
+    outputs = []
+    for transpose in (False, True):
+        for flip_h in (False, True):
+            for flip_v in (False, True):
+                aug = _apply_transform(lr, transpose, flip_h, flip_v)
+                pred = forward(aug)
+                pred = _inverse_transform(pred, transpose, flip_h, flip_v)
+                outputs.append(pred)
+    stacked = torch.stack(outputs, dim=0).mean(dim=0)
+    return stacked.clamp(0.0, 1.0)
+
+
 def resolve_eval_paths(config):
     data_cfg = config["data"]
     source = data_cfg.get("root") or data_cfg.get("val_split") or data_cfg.get("test_split")
@@ -121,9 +216,17 @@ def build_model(model_cfg, device):
     return model
 
 
-def load_checkpoint(model, ckpt_path):
-    state = _safe_torch_load(ckpt_path)
-    state_dict = _select_state_dict(state)
+def load_checkpoint(model, ckpt_path, variant, state=None):
+    if state is None:
+        state = _safe_torch_load(ckpt_path)
+    if variant == "ema" and isinstance(state, dict) and "ema_state" in state:
+        state_dict = state["ema_state"]
+    elif variant == "swa" and isinstance(state, dict) and "swa_state" in state:
+        state_dict = state["swa_state"]
+    else:
+        state_dict = _select_state_dict(state)
+        if variant in ("ema", "swa"):
+            print(f"warning: checkpoint {ckpt_path} missing {variant} weights, using base model state")
     if hasattr(state_dict, "items"):
         cleaned = {}
         for key, value in state_dict.items():
@@ -134,6 +237,7 @@ def load_checkpoint(model, ckpt_path):
             cleaned[name] = value
         state_dict = cleaned
     model.load_state_dict(state_dict, strict=True)
+    return state
 
 def _clean_state_dict(state_dict):
     cleaned = {}
@@ -168,17 +272,6 @@ def crop_border_tensor(tensor, border):
     if border == 0:
         return tensor
     return tensor[..., border:h - border, border:w - border]
-
-
-def to_y_channel(tensor):
-    if tensor.size(1) == 1:
-        return tensor
-    if tensor.size(1) != 3:
-        return tensor
-    r = tensor[:, 0:1]
-    g = tensor[:, 1:2]
-    b = tensor[:, 2:3]
-    return 0.257 * r + 0.504 * g + 0.098 * b + 16.0 / 255.0
 
 
 def compute_psnr(sr, hr):
@@ -237,7 +330,7 @@ def save_example_strip(path, hr_tensor, lr_tensor, sr_tensor):
 
 
 def write_metrics_csv(path, rows):
-    fieldnames = ["image", "psnr", "ssim", "l1", "lpips"]
+    fieldnames = ["image", "psnr", "ssim", "l1", "lpips", "grad_l1"]
     with path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
@@ -249,6 +342,7 @@ def write_metrics_csv(path, rows):
                     "ssim": "" if row["ssim"] is None else f"{row['ssim']:.6f}",
                     "l1": f"{row['l1']:.6f}",
                     "lpips": "" if row["lpips"] is None else f"{row['lpips']:.6f}",
+                    "grad_l1": f"{row['grad_l1']:.6f}",
                 }
             )
 
@@ -256,7 +350,7 @@ def write_metrics_csv(path, rows):
 def write_summary_files(out_dir, summaries):
     summary_csv = out_dir / "summary.csv"
     summary_json = out_dir / "summary.json"
-    fieldnames = ["label", "psnr", "ssim", "l1", "lpips", "count"]
+    fieldnames = ["label", "psnr", "ssim", "l1", "lpips", "grad_l1", "count"]
     with summary_csv.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
@@ -269,6 +363,7 @@ def write_summary_files(out_dir, summaries):
                     "ssim": ssim_str,
                     "l1": f"{row['l1']:.6f}",
                     "lpips": "" if math.isnan(row["lpips"]) else f"{row['lpips']:.6f}",
+                    "grad_l1": f"{row['grad_l1']:.6f}",
                     "count": row["count"],
                 }
             )
@@ -281,6 +376,7 @@ def write_summary_files(out_dir, summaries):
                 "ssim": None if math.isnan(row["ssim"]) else round(row["ssim"], 6),
                 "l1": round(row["l1"], 6),
                 "lpips": None if math.isnan(row["lpips"]) else round(row["lpips"], 6),
+                "grad_l1": round(row["grad_l1"], 6),
                 "count": row["count"],
             }
         )
@@ -321,10 +417,22 @@ def make_bar_chart(out_path, summaries, key, title, ylabel):
     plt.close(fig)
 
 
-def evaluate_model(label, ckpt_path, model_cfg, degradation_cfg, paths, device,
-                   out_root, use_y, crop_border, dump_count, lpips_model, mode="normal"):
-
-    # load ckpt/config (unchanged) ...
+def evaluate_model(
+    label,
+    ckpt_path,
+    model_cfg,
+    degradation_cfg,
+    paths,
+    device,
+    out_root,
+    use_y,
+    crop_border,
+    dump_count,
+    lpips_model,
+    mode="normal",
+    tta_enabled=True,
+    variant="model",
+):
     state = _safe_torch_load(ckpt_path)
     ckpt_model_cfg = None
     if isinstance(state, dict):
@@ -333,18 +441,15 @@ def evaluate_model(label, ckpt_path, model_cfg, degradation_cfg, paths, device,
             ckpt_model_cfg = cfg.get("model")
 
     model_cfg_local = ckpt_model_cfg or model_cfg
-    model = build_model(model_cfg_local, device)  # this will be x2 for base, x4 for x4 ckpts
-
-    state_dict = _select_state_dict(state)
-    if hasattr(state_dict, "items"):
-        state_dict = _clean_state_dict(state_dict)
-    model.load_state_dict(state_dict, strict=True)
+    residual_enabled = bool(model_cfg_local.get("residual_output", False))
+    model = build_model(model_cfg_local, device)
+    load_checkpoint(model, ckpt_path, variant, state=state)
 
     model_dir = (Path(out_root) / label)
     model_dir.mkdir(parents=True, exist_ok=True)
 
     metrics_rows, psnr_values, ssim_values = [], [], []
-    l1_values, lpips_values = [], []
+    l1_values, lpips_values, grad_values = [], [], []
     net_scale = int(model_cfg_local["scale"])
     if mode == "twopass" and net_scale != 2:
         raise ValueError(f"twopass expects a ×2 model, got ×{net_scale}")
@@ -357,12 +462,7 @@ def evaluate_model(label, ckpt_path, model_cfg, degradation_cfg, paths, device,
             lr = downscale_with_profile(hr_image, degrade_scale, degradation_cfg, rng).unsqueeze(0).to(device)
             hr = tensor_from_pil(hr_image).unsqueeze(0).to(device)
 
-            if mode == "twopass":
-                # x2 model run twice to get x4
-                mid = model(lr).clamp(0.0, 1.0)
-                sr  = model(mid).clamp(0.0, 1.0)
-            else:
-                sr  = model(lr).clamp(0.0, 1.0)
+            sr = run_inference(model, lr, net_scale, residual_enabled, tta_enabled, mode)
 
             sr_aligned, hr_aligned = center_crop_to_match(sr, hr)
             sr_eval = crop_border_tensor(sr_aligned, crop_border)
@@ -375,14 +475,16 @@ def evaluate_model(label, ckpt_path, model_cfg, degradation_cfg, paths, device,
             s = compute_ssim(sr_metric, hr_metric)
             l1 = compute_l1(sr_metric, hr_metric)
             lp = compute_lpips(sr_eval, hr_eval, lpips_model)
+            g = compute_grad_l1(sr_eval, hr_eval)
 
-            metrics_rows.append({"image": str(path), "psnr": p, "ssim": s, "l1": l1, "lpips": lp})
+            metrics_rows.append({"image": str(path), "psnr": p, "ssim": s, "l1": l1, "lpips": lp, "grad_l1": g})
             psnr_values.append(p)
             if s is not None:
                 ssim_values.append(s)
             l1_values.append(l1)
             if lp is not None:
                 lpips_values.append(lp)
+            grad_values.append(g)
 
             if idx < dump_count:
                 save_example_strip(model_dir / "examples" / f"{idx:04d}.png", hr_aligned, lr, sr_aligned)
@@ -392,7 +494,16 @@ def evaluate_model(label, ckpt_path, model_cfg, degradation_cfg, paths, device,
     mean_ssim = float("nan") if not ssim_values else sum(ssim_values) / len(ssim_values)
     mean_l1 = sum(l1_values) / len(l1_values)
     mean_lpips = float("nan") if not lpips_values else sum(lpips_values) / len(lpips_values)
-    return {"label": label, "psnr": mean_psnr, "ssim": mean_ssim, "l1": mean_l1, "lpips": mean_lpips, "count": len(paths)}
+    mean_grad = sum(grad_values) / len(grad_values)
+    return {
+        "label": label,
+        "psnr": mean_psnr,
+        "ssim": mean_ssim,
+        "l1": mean_l1,
+        "lpips": mean_lpips,
+        "grad_l1": mean_grad,
+        "count": len(paths),
+    }
 
 def main():
     args = parse_args()
@@ -407,8 +518,10 @@ def main():
     out_root.mkdir(parents=True, exist_ok=True)
     model_specs = parse_model_specs(args.models)
     lpips_model = None if args.no_lpips else build_lpips(args.lpips_net, device)
+    eval_cfg = config.get("eval", {})
+    tta_enabled = bool(eval_cfg.get("tta", True))
     summaries = []
-    for label, ckpt_path, mode in model_specs:
+    for label, ckpt_path, mode, variant in model_specs:
         summary = evaluate_model(
             label=label,
             ckpt_path=ckpt_path,
@@ -421,7 +534,9 @@ def main():
             crop_border=crop_border,
             dump_count=dump_count,
             lpips_model=lpips_model,
-            mode=mode,   # <- add this
+            mode=mode,
+            tta_enabled=tta_enabled,
+            variant=variant,
         )
         summaries.append(summary)
     write_summary_files(out_root, summaries)

@@ -1,220 +1,39 @@
 import argparse
-import inspect
-import random
+import copy
+import math
 from contextlib import nullcontext
 from multiprocessing import Manager
 from pathlib import Path
 
-import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import yaml
 
-
-from src.utils.seed import set_seed
-from src.models import EDSR
 from src.data import PixelArtDataset, DegradationConfig
 from src.data.utils import auto_split_paths, read_split_file
+from src.models import EDSR
+from src.training import (
+    EMAHelper,
+    LossComputer,
+    SWAHelper,
+    apply_residual_output,
+    build_degradation_schedule,
+    build_patch_schedule,
+    damp_optimizer_moments,
+    extract_adapted_weights,
+    pick_device,
+    safe_torch_load,
+    schedule_index,
+    set_worker_seed_base,
+    to_y,
+    unwrap_model,
+    worker_seed_init,
+)
+from src.utils.seed import set_seed
 from torchmetrics.functional.image import structural_similarity_index_measure
-
-_WORKER_BASE_SEED = 0
-_TORCH_LOAD_SUPPORTS_WEIGHTS_ONLY = "weights_only" in inspect.signature(torch.load).parameters
-
-def _safe_torch_load(path, *, weights_only=False):
-    load_kwargs = {"map_location": "cpu"}
-    if weights_only and _TORCH_LOAD_SUPPORTS_WEIGHTS_ONLY:
-        load_kwargs["weights_only"] = True
-    return torch.load(path, **load_kwargs)
-
-
-def set_worker_seed_base(seed):
-    global _WORKER_BASE_SEED
-    _WORKER_BASE_SEED = seed
-
-
-def worker_seed_init(worker_id):
-    worker_seed = (_WORKER_BASE_SEED + worker_id) % 2**32
-    np.random.seed(worker_seed)
-    random.seed(worker_seed)
-    torch.manual_seed(worker_seed)
-
-def _adapt_pretrained_key(key):
-    for pref in ("module.", "model.", "_orig_mod."):
-        if key.startswith(pref):
-            key = key[len(pref):]
-
-    if key.startswith("sub_mean") or key.startswith("add_mean"):
-        return None
-
-    if key.startswith("head.0."):
-        return "head." + key[len("head.0."):]
-
-    if key.startswith("body."):
-        parts = key.split(".")
-        if len(parts) >= 4:
-            block_idx = parts[1]
-            layer = parts[2]
-            remainder = ".".join(parts[3:])
-            if layer == "0":
-                base = f"body.{block_idx}.conv1"
-                return f"{base}.{remainder}" if remainder else base
-            if layer == "2":
-                base = f"body.{block_idx}.conv2"
-                return f"{base}.{remainder}" if remainder else base
-            return key
-
-    if key.startswith("body_conv"):
-        return key
-
-    if key.startswith("tail.0.0."):
-        return "tail.0." + key[len("tail.0.0."):]
-    if key.startswith("tail.1."):
-        return "tail.2." + key[len("tail.1."):]
-
-    if key.startswith("tail.") or key.startswith("head."):
-        return key
-
-    return key
-
-
-def _extract_adapted_weights(state_dict, model_state, allow_tail=True):
-    adapted = {}
-    matched_tail = set()
-    for raw_key, tensor in state_dict.items():
-        candidate_keys = []
-        if raw_key in model_state:
-            candidate_keys.append(raw_key)
-        new_key = _adapt_pretrained_key(raw_key)
-        if new_key is not None and new_key not in candidate_keys:
-            candidate_keys.append(new_key)
-        for key in candidate_keys:
-            is_tail = key.startswith("tail.")
-            if is_tail:
-                if not allow_tail:
-                    continue
-            if key not in model_state:
-                continue
-            if model_state[key].shape != tensor.shape:
-                continue
-            adapted[key] = tensor
-            if is_tail:
-                matched_tail.add(key)
-            break
-    return adapted, matched_tail
-
-
-def _to_y(t):
-    if t.size(1) == 1:
-        return t
-    if t.size(1) != 3:
-        raise ValueError(f"Expected 1 or 3 channels, got {t.size(1)}")
-    r = t[:, 0:1]
-    g = t[:, 1:2]
-    b = t[:, 2:3]
-    return 0.257 * r + 0.504 * g + 0.098 * b + 16.0 / 255.0
-
-
-def charbonnier_loss(sr, hr, eps):
-    diff = sr - hr
-    return torch.sqrt(diff * diff + eps * eps).mean()
-
-
-def gradient_loss(sr, hr, kernel_x, kernel_y):
-    sr_y = _to_y(sr)
-    hr_y = _to_y(hr)
-    kernel_x = kernel_x.to(sr_y.dtype)
-    kernel_y = kernel_y.to(sr_y.dtype)
-    grad_sr_x = F.conv2d(sr_y, kernel_x, padding=1)
-    grad_hr_x = F.conv2d(hr_y, kernel_x, padding=1)
-    grad_sr_y = F.conv2d(sr_y, kernel_y, padding=1)
-    grad_hr_y = F.conv2d(hr_y, kernel_y, padding=1)
-    diff_x = torch.abs(grad_sr_x - grad_hr_x).mean()
-    diff_y = torch.abs(grad_sr_y - grad_hr_y).mean()
-    return diff_x + diff_y
-
-
-def build_loss_fn(config, device):
-    loss_cfg = config.get("loss", {})
-    weights = {
-        "charbonnier": float(loss_cfg.get("charbonnier_weight", 0.0)),
-        "l1": float(loss_cfg.get("l1_weight", 0.0)),
-        "grad": float(loss_cfg.get("grad_weight", 0.0)),
-        "lpips": float(loss_cfg.get("lpips_weight", 0.0)),
-    }
-    eps = float(loss_cfg.get("charbonnier_eps", 1e-3))
-    lpips_model = None
-    grad_kernel_x = None
-    grad_kernel_y = None
-    if weights["grad"] > 0.0:
-        base = torch.tensor(
-            [[1.0, 0.0, -1.0], [2.0, 0.0, -2.0], [1.0, 0.0, -1.0]],
-            dtype=torch.float32,
-            device=device,
-        ).view(1, 1, 3, 3)
-        grad_kernel_x = base
-        grad_kernel_y = base.transpose(2, 3)
-    if weights["lpips"] > 0.0:
-        import lpips
-
-        lpips_model = lpips.LPIPS(net=loss_cfg.get("lpips_net", "alex")).to(device)
-        lpips_model.eval()
-        for param in lpips_model.parameters():
-            param.requires_grad = False
-
-    if not any(weights.values()):
-        return lambda sr, hr: F.mse_loss(sr, hr)
-
-    def compute(sr, hr):
-        total = 0.0
-        if weights["charbonnier"] > 0.0:
-            total += weights["charbonnier"] * charbonnier_loss(sr, hr, eps)
-        if weights["l1"] > 0.0:
-            total += weights["l1"] * torch.abs(sr - hr).mean()
-        if weights["grad"] > 0.0:
-            total += weights["grad"] * gradient_loss(sr, hr, grad_kernel_x, grad_kernel_y)
-        if weights["lpips"] > 0.0 and lpips_model is not None:
-            sr_lp = sr.float().mul(2.0).sub(1.0)
-            hr_lp = hr.float().mul(2.0).sub(1.0)
-            lpips_value = lpips_model(sr_lp, hr_lp).mean()
-            total += weights["lpips"] * lpips_value
-        return total
-
-    return compute
-
-
-def _build_patch_schedule(data_cfg):
-    raw = data_cfg.get("patch_schedule") or []
-    entries = []
-    for item in raw:
-        step = int(item.get("step", 0))
-        size = int(item.get("size", 0))
-        if step < 0 or size <= 0:
-            continue
-        entries.append((step, size))
-    entries.sort(key=lambda pair: pair[0])
-    return entries
-
-
-def _patch_index_for_step(step, schedule):
-    idx = 0
-    for i, (boundary, _) in enumerate(schedule):
-        if step >= boundary:
-            idx = i
-        else:
-            break
-    return idx
-
-
-def pick_device(preferred=None):
-    if preferred:
-        return torch.device(preferred)
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
 
 
 def main():
@@ -237,6 +56,14 @@ def main():
     pilot_mode = bool(args.pilot)
 
     training_cfg = config["training"]
+    total_steps = int(training_cfg["steps"])
+    pilot_steps = training_cfg.get("pilot_steps")
+    if pilot_mode:
+        if pilot_steps is None:
+            pilot_steps = training_cfg.get("val_every", total_steps)
+        pilot_steps = max(int(pilot_steps), 1)
+        total_steps = min(total_steps, pilot_steps)
+        print(f"[pilot] limiting training to {total_steps} steps (pilot_steps={pilot_steps})")
     tail_only = bool(training_cfg.get("tail_only", True))
     early_stop_patience = int(training_cfg.get("early_stop_patience", 0) or 0)
     early_stop_min_delta = float(training_cfg.get("early_stop_min_delta", 0.0))
@@ -256,16 +83,25 @@ def main():
         res_scale=model_cfg["res_scale"],
     ).to(device)
 
-    degradation_cfg = DegradationConfig(**config["degradations"])
+    base_degrad_cfg = config["degradations"]
+    degradation_cfg = DegradationConfig(**base_degrad_cfg)
 
     data_cfg = config["data"]
-    patch_schedule = _build_patch_schedule(data_cfg)
+    patch_schedule = build_patch_schedule(data_cfg, total_steps)
+    degrad_schedule = build_degradation_schedule(base_degrad_cfg, data_cfg.get("degrad_schedule"), total_steps)
+    manager = None
     patch_ref = None
+    degrad_ref = None
     patch_cursor = 0
-    patch_manager = None
+    degrad_cursor = 0
+    if patch_schedule or degrad_schedule:
+        manager = Manager()
     if patch_schedule:
-        patch_manager = Manager()
-        patch_ref = patch_manager.Value("i", patch_schedule[0][1])
+        patch_ref = manager.Value("i", patch_schedule[0][1])
+    if degrad_schedule:
+        degrad_ref = manager.Value("i", 0)
+
+    train_degrad_configs = [cfg for _, cfg in degrad_schedule] if degrad_schedule else [degradation_cfg]
 
     auto_root = data_cfg.get("root")
     ratios = data_cfg.get("auto_split_ratio", {"train": 0.8, "val": 0.1, "test": 0.1})
@@ -285,6 +121,8 @@ def main():
     cache_images = data_cfg.get("cache_images", True)
     val_cache_images = data_cfg.get("val_cache_images", cache_images)
 
+    channels_last = bool(data_cfg.get("channels_last", True))
+
     train_dataset = PixelArtDataset(
         paths=train_paths,
         scale=model_cfg["scale"],
@@ -296,6 +134,9 @@ def main():
         augment=True,
         cache_images=cache_images,
         patch_size_ref=patch_ref,
+        degradation_configs=train_degrad_configs,
+        degradation_phase_ref=degrad_ref,
+        edge_sampling=data_cfg.get("edge_sampling"),
     )
     val_dataset = PixelArtDataset(
         paths=val_paths,
@@ -307,11 +148,12 @@ def main():
         rotations=False,
         augment=False,
         cache_images=val_cache_images,
+        degradation_configs=[degradation_cfg],
     )
 
     pin_memory = device.type == "cuda"
 
-    loss_fn = build_loss_fn(config, device)
+    loss_computer = LossComputer(config, device, total_steps)
 
     train_workers = data_cfg.get("train_workers", 4)
     val_workers = data_cfg.get("val_workers", 2)
@@ -351,10 +193,10 @@ def main():
     resume_path = args.resume_from
     if resume_path and Path(resume_path).is_file():
         # Safe load and adapt keys from compiled/wrapped checkpoints
-        resume_state = _safe_torch_load(resume_path, weights_only=True)
+        resume_state = safe_torch_load(resume_path, weights_only=True)
         raw_state = resume_state.get("model", resume_state)
         model_state = model.state_dict()
-        adapted, _ = _extract_adapted_weights(raw_state, model_state, allow_tail=True)
+        adapted, _ = extract_adapted_weights(raw_state, model_state, allow_tail=True)
 
         if not adapted:
             raise RuntimeError(f"no compatible tensors when resuming from {resume_path}")
@@ -363,8 +205,11 @@ def main():
         start_step = int(resume_state.get("step", 0))
 
     if patch_ref is not None and patch_schedule:
-        patch_cursor = _patch_index_for_step(start_step, patch_schedule)
+        patch_cursor = schedule_index(start_step, patch_schedule)
         patch_ref.value = patch_schedule[patch_cursor][1]
+    if degrad_ref is not None and degrad_schedule:
+        degrad_cursor = schedule_index(start_step, degrad_schedule)
+        degrad_ref.value = degrad_cursor
 
     # Decide whether to inherit best_psnr from the checkpoint
     best_psnr = None
@@ -388,10 +233,10 @@ def main():
     else:
         pretrained_path = config.get("pretrained_path")
         if pretrained_path and Path(pretrained_path).is_file():
-            loaded = _safe_torch_load(pretrained_path, weights_only=True)
+            loaded = safe_torch_load(pretrained_path, weights_only=True)
             state_dict = loaded["model"] if "model" in loaded else loaded
             model_state = model.state_dict()
-            adapted, matched_tail = _extract_adapted_weights(
+            adapted, matched_tail = extract_adapted_weights(
                 state_dict, model_state, allow_tail=True
             )
             if adapted:
@@ -404,7 +249,7 @@ def main():
 
     baseline_path = config.get("baseline_path")
     if baseline_path and Path(baseline_path).is_file():
-        loaded = _safe_torch_load(baseline_path, weights_only=True)
+        loaded = safe_torch_load(baseline_path, weights_only=True)
         baseline_state = loaded["model"] if "model" in loaded else loaded
         baseline_model = EDSR(
             scale=model_cfg["scale"],
@@ -413,7 +258,7 @@ def main():
             res_scale=model_cfg["res_scale"],
         ).to(device)
         baseline_model_state = baseline_model.state_dict()
-        adapted_baseline, _ = _extract_adapted_weights(
+        adapted_baseline, _ = extract_adapted_weights(
             baseline_state, baseline_model_state, allow_tail=True
         )
         if not adapted_baseline:
@@ -437,6 +282,34 @@ def main():
                     f"baseline L1 {b_l1:.6f} | PSNR {b_psnr:.4f} | SSIM {b_ssim:.4f}"
                 )
 
+
+    ema_helper = None
+    ema_cfg = training_cfg.get("ema", {})
+    if ema_cfg.get("enabled"):
+        ema_model = copy.deepcopy(unwrap_model(model)).to(device)
+        ema_model.eval()
+        for param in ema_model.parameters():
+            param.requires_grad = False
+        ema_decay = ema_cfg.get("decay", 0.9999)
+        ema_update_every = ema_cfg.get("update_every", 1)
+        ema_helper = EMAHelper(ema_model, ema_decay, ema_update_every)
+        if resume_state and "ema_state" in resume_state:
+            ema_helper.load_state_dict(
+                {"model": resume_state["ema_state"], "updates": resume_state.get("ema_updates", 0)}
+            )
+
+    swa_helper = None
+    swa_cfg = training_cfg.get("swa", {})
+    swa_start_step = None
+    swa_update_every = None
+    if swa_cfg.get("enabled") and ema_helper is not None:
+        swa_helper = SWAHelper(ema_helper.model)
+        swa_start_step = int(total_steps * float(swa_cfg.get("start_frac", 0.8)))
+        swa_update_every = max(1, int(swa_cfg.get("update_every", 5000)))
+        if resume_state and "swa_state" in resume_state:
+            swa_helper.load_state_dict(
+                {"model": resume_state["swa_state"], "samples": resume_state.get("swa_samples", 0)}
+            )
 
     if config["training"].get("compile", False) and device.type == "cuda":
         model = torch.compile(model)
@@ -489,6 +362,104 @@ def main():
         scaler = None
         autocast_context = nullcontext
 
+    distill_cfg = config.get("distillation", {})
+    distill_enabled = bool(distill_cfg.get("enabled"))
+    teacher_model = None
+    teacher_scale = None
+    teacher_residual = False
+    teacher_twopass = bool(distill_cfg.get("teacher_twopass", False))
+    distill_sample_frac = float(distill_cfg.get("sample_frac", 1.0))
+    distill_sample_frac = max(0.0, min(1.0, distill_sample_frac))
+    distill_weight_max = float(distill_cfg.get("weight_max", 0.0))
+    distill_weight_final = float(distill_cfg.get("weight_final", distill_weight_max))
+    distill_start_frac = float(distill_cfg.get("start_frac", 0.0))
+    distill_final_frac = float(distill_cfg.get("final_frac", 0.9))
+    distill_start_step = int(total_steps * distill_start_frac)
+    distill_final_step = int(total_steps * distill_final_frac)
+    distill_final_step = max(distill_final_step, distill_start_step)
+    teacher_path = distill_cfg.get("teacher_path")
+    if distill_enabled:
+        if not teacher_path or not Path(teacher_path).is_file():
+            print("warning: distillation enabled but teacher_path missing; disabling distillation")
+            distill_enabled = False
+        else:
+            teacher_state = safe_torch_load(teacher_path, weights_only=True)
+            teacher_model_cfg = teacher_state.get("config", {}).get("model", model_cfg)
+            teacher_scale = int(teacher_model_cfg.get("scale", model_cfg["scale"]))
+            teacher_residual = bool(teacher_model_cfg.get("residual_output", False))
+            teacher_model = EDSR(
+                scale=teacher_scale,
+                n_feats=teacher_model_cfg.get("n_feats", model_cfg["n_feats"]),
+                n_resblocks=teacher_model_cfg.get("n_resblocks", model_cfg["n_resblocks"]),
+                res_scale=teacher_model_cfg.get("res_scale", model_cfg["res_scale"]),
+            ).to(device)
+            teacher_model.eval()
+            for param in teacher_model.parameters():
+                param.requires_grad = False
+            candidate = (
+                teacher_state.get("ema_state")
+                or teacher_state.get("model")
+                or teacher_state.get("state_dict")
+                or teacher_state
+            )
+            teacher_params = teacher_model.state_dict()
+            adapted, _ = extract_adapted_weights(candidate, teacher_params, allow_tail=True)
+            if not adapted:
+                raise RuntimeError(f"could not adapt teacher checkpoint {teacher_path}")
+            teacher_params.update(adapted)
+            teacher_model.load_state_dict(teacher_params, strict=True)
+
+    def _distill_weight_for_step(step):
+        if not distill_enabled or distill_weight_max <= 0.0:
+            return 0.0
+        if step < distill_start_step:
+            return 0.0
+        total_range = max(1, total_steps - distill_start_step)
+        progress = min(max((step - distill_start_step) / total_range, 0.0), 1.0)
+        weight = distill_weight_max * progress
+        if distill_weight_final != distill_weight_max and step >= distill_final_step:
+            tail_range = max(1, total_steps - distill_final_step)
+            tail = min(max((step - distill_final_step) / tail_range, 0.0), 1.0)
+            weight = distill_weight_max + (distill_weight_final - distill_weight_max) * tail
+        return max(0.0, weight)
+
+    def _teacher_forward(lr_input):
+        if not distill_enabled or teacher_model is None:
+            return None
+        if teacher_twopass:
+            mid = teacher_model(lr_input)
+            mid = apply_residual_output(mid, lr_input, teacher_scale, teacher_residual)
+            mid = mid.clamp(0.0, 1.0)
+            sr = teacher_model(mid)
+            sr = apply_residual_output(sr, mid, teacher_scale, teacher_residual)
+            return sr
+        sr = teacher_model(lr_input)
+        return apply_residual_output(sr, lr_input, teacher_scale, teacher_residual)
+
+    def _maybe_apply_distillation(step, sr_batch, lr_batch, loss_tensor, loss_terms):
+        if not distill_enabled:
+            loss_terms["distill"] = 0.0
+            return loss_tensor, 0.0
+        weight = _distill_weight_for_step(step)
+        if weight <= 0.0:
+            loss_terms["distill"] = 0.0
+            return loss_tensor, weight
+        sample = torch.rand((), device=lr_batch.device).item()
+        if sample >= distill_sample_frac:
+            loss_terms["distill"] = 0.0
+            return loss_tensor, weight
+        teacher_out = None
+        with torch.no_grad():
+            ctx = autocast_context if amp_enabled else nullcontext
+            with ctx():
+                teacher_out = _teacher_forward(lr_batch)
+        if teacher_out is None:
+            loss_terms["distill"] = 0.0
+            return loss_tensor, weight
+        teacher_out = teacher_out.clamp(0.0, 1.0)
+        distill_loss = F.mse_loss(sr_batch, teacher_out)
+        loss_terms["distill"] = float(distill_loss.detach())
+        return loss_tensor + weight * distill_loss, weight
     # If resuming, load optimizer (and scaler) state before computing base_lrs
     if resume_state is not None:
         if "optimizer" in resume_state:
@@ -507,18 +478,34 @@ def main():
             except Exception as e:
                 print(f"warning: could not load AMP scaler state: {e}")
 
-    total_steps = training_cfg["steps"]
-    pilot_steps = training_cfg.get("pilot_steps")
-    if pilot_mode:
-        if pilot_steps is None:
-            pilot_steps = training_cfg.get("val_every", total_steps)
-        pilot_steps = max(int(pilot_steps), 1)
-        total_steps = min(total_steps, pilot_steps)
-        print(f"[pilot] limiting training to {total_steps} steps (pilot_steps={pilot_steps})")
     warmup_steps = training_cfg.get("warmup_steps", 0)
     warmup_start_factor = training_cfg.get("warmup_start_factor", 1e-3)
+    scheduler_cfg = training_cfg.get("scheduler", {})
+    scheduler_type = (scheduler_cfg.get("type") or "").lower()
+    min_lr_factor = float(scheduler_cfg.get("min_lr_factor", 1.0))
+    final_floor_factor = float(scheduler_cfg.get("final_min_lr_factor", min_lr_factor))
+    final_floor_start = float(scheduler_cfg.get("final_phase_start", 0.9))
+    patch_mini_warmup_steps = int(training_cfg.get("patch_mini_warmup_steps", 0))
+    mini_warmup_start = None
+    mini_warmup_end = None
+    def _scheduled_lrs_for_step(step):
+        if scheduler_type != "cosine" or step <= warmup_steps:
+            return list(base_lrs)
+        denom = max(1, total_steps - warmup_steps)
+        progress = min(max((step - warmup_steps) / denom, 0.0), 1.0)
+        floor = min_lr_factor
+        if final_floor_factor != min_lr_factor and progress >= final_floor_start:
+            tail = (progress - final_floor_start) / max(1e-8, 1.0 - final_floor_start)
+            tail = min(max(tail, 0.0), 1.0)
+            floor = min_lr_factor + (final_floor_factor - min_lr_factor) * tail
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return [base * (floor + (1.0 - floor) * cosine) for base in base_lrs]
     # compute base_lrs after any resume has potentially changed group LRs
     base_lrs = target_lrs
+    trainable_params = [p for p in unwrap_model(model).parameters() if p.requires_grad]
+    grad_clip_cfg = training_cfg.get("grad_clip", {})
+    grad_clip_enabled = bool(grad_clip_cfg.get("enabled"))
+    grad_clip_max = float(grad_clip_cfg.get("max_norm", 0.0))
     default_dir = f"runs/edsr_x{model_cfg['scale']}"
     output_dir = Path(config.get("output_dir", default_dir))
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -532,13 +519,35 @@ def main():
         model.train()
         train_iter = iter(train_loader)
         progress = tqdm(range(start_step + 1, total_steps + 1), initial=start_step, total=total_steps)
+        residual_enabled = bool(model_cfg.get("residual_output", False))
+        current_patch = patch_schedule[patch_cursor][1] if patch_schedule else data_cfg.get("patch_size_hr")
+        if patch_ref is not None and current_patch is not None:
+            patch_ref.value = current_patch
         for step in progress:
+            if mini_warmup_end is not None and step > mini_warmup_end:
+                mini_warmup_start = None
+                mini_warmup_end = None
             if patch_ref is not None and patch_schedule:
                 while patch_cursor + 1 < len(patch_schedule) and step >= patch_schedule[patch_cursor + 1][0]:
                     patch_cursor += 1
-                    new_patch = patch_schedule[patch_cursor][1]
-                    patch_ref.value = new_patch
-                    print(f"[patch] step {step} patch_size={new_patch}")
+                    current_patch = patch_schedule[patch_cursor][1]
+                    patch_ref.value = current_patch
+                    print(f"[patch] step {step} patch_size={current_patch}")
+                    if patch_mini_warmup_steps > 0:
+                        mini_warmup_start = step
+                        mini_warmup_end = step + patch_mini_warmup_steps
+                    else:
+                        mini_warmup_start = None
+                        mini_warmup_end = None
+                    damp_optimizer_moments(optimizer, 0.5)
+            if degrad_ref is not None and degrad_schedule:
+                while degrad_cursor + 1 < len(degrad_schedule) and step >= degrad_schedule[degrad_cursor + 1][0]:
+                    degrad_cursor += 1
+                    degrad_ref.value = degrad_cursor
+                    phase = train_degrad_configs[degrad_cursor]
+                    print(
+                        f"[degrad] step {step} jpeg={phase.jpeg_prob:.2f} noise={phase.gaussian_noise_prob:.3f}"
+                    )
             try:
                 lr_batch, hr_batch = next(train_iter)
             except StopIteration:
@@ -547,43 +556,85 @@ def main():
 
             lr_batch = lr_batch.to(device, non_blocking=True)
             hr_batch = hr_batch.to(device, non_blocking=True)
+            if channels_last:
+                lr_batch = lr_batch.to(memory_format=torch.channels_last)
+                hr_batch = hr_batch.to(memory_format=torch.channels_last)
 
             optimizer.zero_grad(set_to_none=True)
 
-            # Apply warmup only if not resuming past warmup. If we resumed during warmup,
-            # continue from the current step; otherwise preserve checkpoint LRs.
             in_warmup = warmup_steps > 0 and step <= warmup_steps
             resuming_past_warmup = resuming and (resume_step >= warmup_steps)
-
-            if in_warmup and not resuming_past_warmup:
-                progress_frac = step / warmup_steps
-                factor = warmup_start_factor + (1.0 - warmup_start_factor) * progress_frac
-                for lr, group in zip(base_lrs, optimizer.param_groups):
-                    group["lr"] = lr * factor
-            elif warmup_steps > 0 and step == warmup_steps + 1 and not resuming_past_warmup:
-                # Ensure exact base LR at the first step after warmup (only when not resuming past warmup)
-                for lr, group in zip(base_lrs, optimizer.param_groups):
-                    group["lr"] = lr
+            skip_lr_update = resuming_past_warmup and step == start_step + 1
+            if not skip_lr_update:
+                if in_warmup and not resuming_past_warmup:
+                    progress_frac = step / warmup_steps
+                    factor = warmup_start_factor + (1.0 - warmup_start_factor) * progress_frac
+                    for lr, group in zip(base_lrs, optimizer.param_groups):
+                        group["lr"] = lr * factor
+                else:
+                    scheduled = _scheduled_lrs_for_step(step)
+                    if mini_warmup_end is not None and step <= mini_warmup_end and patch_mini_warmup_steps > 0:
+                        frac = (step - mini_warmup_start) / max(1, patch_mini_warmup_steps)
+                        frac = min(max(frac, 0.0), 1.0)
+                        factor = warmup_start_factor + (1.0 - warmup_start_factor) * frac
+                        scheduled = [lr * factor for lr in scheduled]
+                    for lr_value, group in zip(scheduled, optimizer.param_groups):
+                        group["lr"] = lr_value
 
             if amp_enabled:
                 with autocast_context():
                     sr_batch = model(lr_batch)
-                    loss = loss_fn(sr_batch, hr_batch)
-                scaler.scale(loss).backward()
+                    sr_batch = apply_residual_output(sr_batch, lr_batch, model_cfg["scale"], residual_enabled)
+                    loss_value, loss_terms = loss_computer.compute(sr_batch, hr_batch, step)
+                    loss_value, distill_weight = _maybe_apply_distillation(step, sr_batch, lr_batch, loss_value, loss_terms)
+                scaler.scale(loss_value).backward()
+                if grad_clip_enabled and grad_clip_max > 0.0:
+                    scaler.unscale_(optimizer)
+                    clip_grad_norm_(trainable_params, grad_clip_max)
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 sr_batch = model(lr_batch)
-                loss = loss_fn(sr_batch, hr_batch)
-                loss.backward()
+                sr_batch = apply_residual_output(sr_batch, lr_batch, model_cfg["scale"], residual_enabled)
+                loss_value, loss_terms = loss_computer.compute(sr_batch, hr_batch, step)
+                loss_value, distill_weight = _maybe_apply_distillation(step, sr_batch, lr_batch, loss_value, loss_terms)
+                loss_value.backward()
+                if grad_clip_enabled and grad_clip_max > 0.0:
+                    clip_grad_norm_(trainable_params, grad_clip_max)
                 optimizer.step()
 
+            if ema_helper is not None:
+                ema_helper.update(unwrap_model(model))
+            if swa_helper is not None and ema_helper is not None and swa_start_step is not None:
+                if step >= swa_start_step and swa_update_every and step % swa_update_every == 0:
+                    swa_helper.update(ema_helper.model)
+
             if step % 50 == 0 or step == 1:
-                progress.set_description(f"step {step} loss {loss.item():.4f}")
+                loss_num = float(loss_value.detach())
+                comp_bits = ",".join(f"{k[:4]}={v:.3f}" for k, v in loss_terms.items())
+                lr_bits = ",".join(f"{g.get('name', 'pg')}={g['lr']:.2e}" for g in optimizer.param_groups)
+                postfix = {
+                    "loss": f"{loss_num:.4f}",
+                    "lr": lr_bits,
+                    "patch": current_patch,
+                    "distill": f"{distill_weight:.3f}",
+                }
+                progress.set_description(f"step {step} {comp_bits}")
+                progress.set_postfix(postfix)
 
             if step % training_cfg["val_every"] == 0 or step == total_steps:
-                val_l1, val_psnr, val_ssim = validate(model, val_loader, device, config)
-                print(f"validation mean L1: {val_l1:.6f} | PSNR: {val_psnr:.4f} | SSIM: {val_ssim:.4f}")
+                eval_model = ema_helper.model if ema_helper is not None else model
+                val_l1, val_psnr, val_ssim = validate(eval_model, val_loader, device, config)
+                if ema_helper is not None:
+                    raw_l1, raw_psnr, raw_ssim = validate(model, val_loader, device, config)
+                    print(
+                        f"validation EMA L1 {val_l1:.6f} | PSNR {val_psnr:.4f} | SSIM {val_ssim:.4f} || "
+                        f"raw L1 {raw_l1:.6f} | PSNR {raw_psnr:.4f} | SSIM {raw_ssim:.4f}"
+                    )
+                else:
+                    print(
+                        f"validation mean L1: {val_l1:.6f} | PSNR: {val_psnr:.4f} | SSIM: {val_ssim:.4f}"
+                    )
 
                 improved = best_psnr is None or val_psnr > best_psnr + early_stop_min_delta
                 if improved:
@@ -592,19 +643,24 @@ def main():
                 else:
                     epochs_since_improve += 1
 
-                base_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+                base_model = unwrap_model(model)
                 to_save = {
-                    "model": base_model.state_dict(),  # save unwrapped module
+                    "model": base_model.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "step": step,
                     "best_psnr": best_psnr,
                     "epochs_since_improve": epochs_since_improve,
                     "config": config,
                 }
+                if ema_helper is not None:
+                    to_save["ema_state"] = ema_helper.model.state_dict()
+                    to_save["ema_updates"] = ema_helper.updates
+                if swa_helper is not None and swa_helper.has_samples():
+                    to_save["swa_state"] = swa_helper.model.state_dict()
+                    to_save["swa_samples"] = swa_helper.samples
                 if amp_enabled:
                     to_save["scaler"] = scaler.state_dict()
 
-                # always write rolling last
                 last_path = output_dir / "last.pth"
                 torch.save(to_save, last_path)
 
@@ -618,11 +674,41 @@ def main():
                     )
                     break
     finally:
-        if patch_manager is not None:
+        if manager is not None:
             try:
-                patch_manager.shutdown()
+                manager.shutdown()
             except Exception as exc:
-                print(f"warning: could not shutdown patch manager: {exc}")
+                print(f"warning: could not shutdown shared manager: {exc}")
+
+    if swa_helper is not None and swa_helper.has_samples():
+        swa_l1, swa_psnr, swa_ssim = validate(swa_helper.model, val_loader, device, config)
+        swa_payload = {
+            "model": swa_helper.model.state_dict(),
+            "config": config,
+            "swa_samples": swa_helper.samples,
+            "metrics": {"l1": swa_l1, "psnr": swa_psnr, "ssim": swa_ssim},
+        }
+        swa_path = output_dir / "final_swa.pth"
+        torch.save(swa_payload, swa_path)
+        print(f"[swa] L1 {swa_l1:.6f} | PSNR {swa_psnr:.4f} | SSIM {swa_ssim:.4f} → {swa_path}")
+        if best_psnr is None or swa_psnr > best_psnr + early_stop_min_delta:
+            best_psnr = swa_psnr
+            swa_state = swa_helper.model.state_dict()
+            best_payload = {
+                "model": swa_state,
+                "step": total_steps,
+                "best_psnr": best_psnr,
+                "epochs_since_improve": epochs_since_improve,
+                "config": config,
+                "swa_state": swa_state,
+                "swa_samples": swa_helper.samples,
+                "swa_promoted": True,
+            }
+            if ema_helper is not None:
+                best_payload["ema_state"] = ema_helper.model.state_dict()
+                best_payload["ema_updates"] = ema_helper.updates
+            torch.save(best_payload, best_path)
+            print(f"[swa] improved best checkpoint via SWA ({best_psnr:.4f}) → {best_path}")
 
 def _align_spatial_dims(sr_batch, hr_batch):
     # Ensure tensors share the same spatial extent before computing the loss.
@@ -642,6 +728,7 @@ def _align_spatial_dims(sr_batch, hr_batch):
 
 
 def validate(model, loader, device, config):
+    was_training = model.training
     model.eval()
     l1_total = 0.0
     psnr_total = 0.0
@@ -653,12 +740,16 @@ def validate(model, loader, device, config):
     crop = int(eval_cfg.get("crop_border", 0) or 0)
     use_y = bool(eval_cfg.get("y_channel", False))
 
+    residual_enabled = bool(config["model"].get("residual_output", False))
+    scale = int(config["model"]["scale"])
+
     with torch.no_grad():
         for lr_batch, hr_batch in loader:
             lr_batch = lr_batch.to(device, non_blocking=True)
             hr_batch = hr_batch.to(device, non_blocking=True)
 
             sr_batch = model(lr_batch)
+            sr_batch = apply_residual_output(sr_batch, lr_batch, scale, residual_enabled)
             if sr_batch.shape[-2:] != hr_batch.shape[-2:]:
                 sr_batch, hr_batch = _align_spatial_dims(sr_batch, hr_batch)
 
@@ -673,8 +764,8 @@ def validate(model, loader, device, config):
             sr_c = sr_eval
             hr_c = hr_eval
             if use_y:
-                sr_c = _to_y(sr_c)
-                hr_c = _to_y(hr_c)
+                sr_c = to_y(sr_c)
+                hr_c = to_y(hr_c)
             n = sr_c.size(0)
 
             # L1 per sample
@@ -699,7 +790,8 @@ def validate(model, loader, device, config):
 
             count += n
 
-    model.train()
+    if was_training:
+        model.train()
     mean_l1 = l1_total / max(1, count)
     mean_psnr = psnr_total / max(1, count)
     mean_ssim = ssim_total / max(1, ssim_count)

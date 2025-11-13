@@ -1,0 +1,4 @@
+reviews:
+  path_filters:
+    - "!data/**"   # exclude this folder
+    - "**"         # include everything else

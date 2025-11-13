@@ -9,11 +9,13 @@ outputs/
 runs/
 onnx/
 pretrained/
-data/cache/
+data/raw/
 *.log
 *.ckpt
 *.pt
 *.pth
 .serena
+
+
 
 .ruff_cache/
