@@ -6,18 +6,25 @@ import math
 import random
 import warnings
 from pathlib import Path
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    _HAVE_MPL = True
+except Exception:
+    matplotlib = None
+    plt = None
+    _HAVE_MPL = False
 import torch
 import torch.nn.functional as F
 import yaml
-from torchmetrics.image import peak_signal_noise_ratio, structural_similarity_index_measure
+from torchmetrics.functional.image import peak_signal_noise_ratio, structural_similarity_index_measure
 
 from src.data.degradations import DegradationConfig, downscale_with_profile
 from src.data.utils import load_image, tensor_from_pil, resolve_paths_from_source
 from src.models import EDSR
-from src.losses import to_y as to_y_channel
+from src.losses.composite import to_y as to_y_channel
+from src.training.checkpoint import extract_adapted_weights
 
 
 _TORCH_LOAD_SUPPORTS_WEIGHTS_ONLY = "weights_only" in inspect.signature(torch.load).parameters
@@ -45,18 +52,53 @@ def pick_device(preferred=None):
     return torch.device("cpu")
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Evaluate one or more EDSR checkpoints.")
-    parser.add_argument("--config", required=True, help="Path to YAML config.")
-    parser.add_argument("--models", nargs="+", required=True, help="label=ckpt.pth or ckpt.pth entries.")
-    parser.add_argument("--out", default="eval_out", help="Output directory.")
-    parser.add_argument("--dump", type=int, default=4, help="Number of example strips per model.")
-    parser.add_argument("--y", action="store_true", help="Evaluate on Y channel.")
-    parser.add_argument("--crop", type=int, default=0, help="Border crop in pixels.")
-    parser.add_argument("--device", default=None, help="Device override (cpu, cuda, mps, ...).")
-    parser.add_argument("--no_lpips", action="store_true", help="Disable LPIPS metric.")
-    parser.add_argument("--lpips_net", default="alex", help="LPIPS backbone (alex, vgg, squeeze).")
-    return parser.parse_args()
+class EvalConfig:
+    __slots__ = (
+        "config_path",
+        "config",
+        "model_cfg",
+        "degradation_cfg",
+        "paths",
+        "model_specs",
+        "out_root",
+        "dump_count",
+        "use_y",
+        "crop_border",
+        "device",
+        "lpips_enabled",
+        "lpips_net",
+        "tta_enabled",
+    )
+
+    def __init__(self):
+        parser = argparse.ArgumentParser(description="Evaluate one or more EDSR checkpoints.")
+        parser.add_argument("--config", required=True, help="Path to YAML config.")
+        parser.add_argument("--models", nargs="+", required=True, help="label=ckpt.pth or ckpt.pth entries.")
+        parser.add_argument("--out", default="eval_out", help="Output directory.")
+        parser.add_argument("--dump", type=int, default=4, help="Number of example strips per model.")
+        parser.add_argument("--y", action="store_true", help="Evaluate on Y channel.")
+        parser.add_argument("--crop", type=int, default=0, help="Border crop in pixels.")
+        parser.add_argument("--device", default=None, help="Device override (cpu, cuda, mps, ...).")
+        parser.add_argument("--no_lpips", action="store_true", help="Disable LPIPS metric.")
+        parser.add_argument("--lpips_net", default="alex", help="LPIPS backbone (alex, vgg, squeeze).")
+        args = parser.parse_args()
+
+        self.config_path = Path(args.config)
+        self.config = yaml.safe_load(self.config_path.read_text())
+        self.model_cfg = self.config["model"]
+        self.degradation_cfg = DegradationConfig(**self.config["degradations"])
+        self.paths = resolve_eval_paths(self.config)
+        self.model_specs = parse_model_specs(args.models)
+        self.out_root = Path(args.out)
+        self.out_root.mkdir(parents=True, exist_ok=True)
+        self.dump_count = max(0, int(args.dump))
+        self.use_y = bool(args.y)
+        self.crop_border = max(0, int(args.crop))
+        self.device = pick_device(args.device)
+        self.lpips_enabled = not bool(args.no_lpips)
+        self.lpips_net = args.lpips_net
+        eval_cfg = self.config.get("eval", {})
+        self.tta_enabled = bool(eval_cfg.get("tta", True))
 
 
 def parse_model_specs(items):
@@ -101,11 +143,6 @@ def parse_model_specs(items):
     return specs
 
     
-
-
-def load_config(path):
-    config_path = Path(path)
-    return yaml.safe_load(config_path.read_text())
 
 
 def _tensor_mapping(candidate):
@@ -236,6 +273,12 @@ def load_checkpoint(model, ckpt_path, variant, state=None):
                     name = name[len(prefix):]
             cleaned[name] = value
         state_dict = cleaned
+        model_state = model.state_dict()
+        adapted, _ = extract_adapted_weights(state_dict, model_state, allow_tail=True)
+        if adapted:
+            model_state.update(adapted)
+            model.load_state_dict(model_state, strict=True)
+            return state
     model.load_state_dict(state_dict, strict=True)
     return state
 
@@ -384,6 +427,9 @@ def write_summary_files(out_dir, summaries):
 
 
 def make_bar_chart(out_path, summaries, key, title, ylabel):
+    if not _HAVE_MPL:
+        print(f"[eval] matplotlib unavailable, skipping {out_path.name}")
+        return
     if not summaries:
         return
     labels = [row["label"] for row in summaries]
@@ -505,45 +551,39 @@ def evaluate_model(
         "count": len(paths),
     }
 
-def main():
-    args = parse_args()
-    dump_count = max(0, args.dump)
-    crop_border = max(0, args.crop)
-    config = load_config(args.config)
-    model_cfg = config["model"]
-    degradation_cfg = DegradationConfig(**config["degradations"])
-    paths = resolve_eval_paths(config)
-    device = pick_device(args.device)
-    out_root = Path(args.out)
-    out_root.mkdir(parents=True, exist_ok=True)
-    model_specs = parse_model_specs(args.models)
-    lpips_model = None if args.no_lpips else build_lpips(args.lpips_net, device)
-    eval_cfg = config.get("eval", {})
-    tta_enabled = bool(eval_cfg.get("tta", True))
+
+def run(config):
+    lpips_model = None
+    if config.lpips_enabled:
+        lpips_model = build_lpips(config.lpips_net, config.device)
     summaries = []
-    for label, ckpt_path, mode, variant in model_specs:
+    for label, ckpt_path, mode, variant in config.model_specs:
         summary = evaluate_model(
             label=label,
             ckpt_path=ckpt_path,
-            model_cfg=model_cfg,
-            degradation_cfg=degradation_cfg,
-            paths=paths,
-            device=device,
-            out_root=out_root,
-            use_y=args.y,
-            crop_border=crop_border,
-            dump_count=dump_count,
+            model_cfg=config.model_cfg,
+            degradation_cfg=config.degradation_cfg,
+            paths=config.paths,
+            device=config.device,
+            out_root=config.out_root,
+            use_y=config.use_y,
+            crop_border=config.crop_border,
+            dump_count=config.dump_count,
             lpips_model=lpips_model,
             mode=mode,
-            tta_enabled=tta_enabled,
+            tta_enabled=config.tta_enabled,
             variant=variant,
         )
         summaries.append(summary)
-    write_summary_files(out_root, summaries)
-    make_bar_chart(out_root / "bar_psnr.png", summaries, "psnr", "PSNR", "PSNR (dB)")
-    make_bar_chart(out_root / "bar_ssim.png", summaries, "ssim", "SSIM", "SSIM")
-    make_bar_chart(out_root / "bar_l1.png", summaries, "l1", "L1", "L1 (lower better)")
-    make_bar_chart(out_root / "bar_lpips.png", summaries, "lpips", "LPIPS", "LPIPS (lower better)")
+    write_summary_files(config.out_root, summaries)
+    make_bar_chart(config.out_root / "bar_psnr.png", summaries, "psnr", "PSNR", "PSNR (dB)")
+    make_bar_chart(config.out_root / "bar_ssim.png", summaries, "ssim", "SSIM", "SSIM")
+    make_bar_chart(config.out_root / "bar_l1.png", summaries, "l1", "L1", "L1 (lower better)")
+    make_bar_chart(config.out_root / "bar_lpips.png", summaries, "lpips", "LPIPS", "LPIPS (lower better)")
+
+
+def main():
+    run(EvalConfig())
 
 
 if __name__ == "__main__":

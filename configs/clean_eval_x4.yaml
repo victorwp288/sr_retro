@@ -1,0 +1,32 @@
+model:
+  scale: 4
+  n_feats: 64
+  n_resblocks: 32
+  res_scale: 0.1
+  residual_output: true
+
+degradations:
+  nearest_prob: 0.0
+  box_prob: 0.0
+  bilinear_prob: 1.0
+  tiny_blur_prob: 0.0
+  jpeg_prob: 0.0
+  jpeg_quality_min: 95
+  jpeg_quality_max: 95
+  palette_jitter_prob: 0.0
+  palette_jitter_std: 0.0
+  channel_drop_prob: 0.0
+  gaussian_noise_prob: 0.0
+  gaussian_noise_std: 0.0
+
+data:
+  root: null
+  test_split: data/splits/test.txt
+  auto_split_seed: 42
+  auto_split_ratio: { train: 0.8, val: 0.1, test: 0.1 }
+
+eval:
+  crop_border: 4
+  y_channel: true
+  tta: true
+  dump: 4

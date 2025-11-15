@@ -8,7 +8,7 @@ model:
 training:
   steps: 400000
   batch_size: 40
-  val_every: 1000
+  val_every: 2000
   amp: true
   compile: true
   tail_only: false
@@ -83,31 +83,38 @@ degradations:
 
 data:
   root: null
-  train_split: data/splits/train.txt
-  val_split: data/splits/val.txt
-  test_split: data/splits/test.txt
+  train_split: data/splits_jpeg/train.txt
+  val_split: data/splits_jpeg/val.txt
+  test_split: data/splits_jpeg/test.txt
   auto_split_seed: 42
   auto_split_ratio: { train: 0.8, val: 0.1, test: 0.1 }
   patch_size_hr: 128
+  cache_images: true
+  val_cache_images: true
+  defer_degradation: true
   patch_schedule:
     - { step: 0, size: 64 }
     - { step: 133333, size: 96 }
     - { step: 266666, size: 128 }
     - { step: 360000, size: 160 }
-  val_patch_size_hr: null
+  val_patch_size_hr: 128
+  pt_cache_root: data/pt_cache
+  pt_cache_source_root: data
+  edge_metadata_root: data/edge_meta
+  edge_metadata_source_root: data
   crops_tile_aligned_prob: 1.0
   flips: true
   rotations: true
-  val_batch_size: 1
-  train_workers: 12
+  val_batch_size: 8
+  train_workers: 8
   val_workers: 4
-  prefetch_factor: 6
+  prefetch_factor: 2
   val_prefetch_factor: 2
   persistent_workers: true
   val_persistent_workers: true
   edge_sampling:
     enabled: true
-    candidates: 4
+    candidates: 1
     prefer_top_p: 0.6
   degrad_schedule:
     - { step: 0, jpeg_prob: 0.10, gaussian_noise_prob: 0.05 }
