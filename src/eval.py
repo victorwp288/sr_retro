@@ -1,20 +1,45 @@
 import argparse
 import csv
+import inspect
 import json
 import math
 import random
+import warnings
 from pathlib import Path
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    _HAVE_MPL = True
+except Exception:
+    matplotlib = None
+    plt = None
+    _HAVE_MPL = False
 import torch
 import torch.nn.functional as F
 import yaml
-from torchmetrics.functional import peak_signal_noise_ratio, structural_similarity_index_measure
+from torchmetrics.functional.image import peak_signal_noise_ratio, structural_similarity_index_measure
 
 from src.data.degradations import DegradationConfig, downscale_with_profile
 from src.data.utils import load_image, tensor_from_pil, resolve_paths_from_source
 from src.models import EDSR
+from src.losses.composite import to_y as to_y_channel
+from src.training.checkpoint import extract_adapted_weights
+
+
+_TORCH_LOAD_SUPPORTS_WEIGHTS_ONLY = "weights_only" in inspect.signature(torch.load).parameters
+_SOBEL_KERNEL_X = torch.tensor(
+    [[1.0, 0.0, -1.0], [2.0, 0.0, -2.0], [1.0, 0.0, -1.0]],
+    dtype=torch.float32,
+).view(1, 1, 3, 3)
+_SOBEL_KERNEL_Y = _SOBEL_KERNEL_X.transpose(2, 3).contiguous()
+
+
+def _safe_torch_load(path):
+    kwargs = {"map_location": "cpu"}
+    if _TORCH_LOAD_SUPPORTS_WEIGHTS_ONLY:
+        kwargs["weights_only"] = True
+    return torch.load(path, **kwargs)
 
 
 def pick_device(preferred=None):
@@ -27,16 +52,53 @@ def pick_device(preferred=None):
     return torch.device("cpu")
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Evaluate one or more EDSR checkpoints.")
-    parser.add_argument("--config", required=True, help="Path to YAML config.")
-    parser.add_argument("--models", nargs="+", required=True, help="label=ckpt.pth or ckpt.pth entries.")
-    parser.add_argument("--out", default="eval_out", help="Output directory.")
-    parser.add_argument("--dump", type=int, default=4, help="Number of example strips per model.")
-    parser.add_argument("--y", action="store_true", help="Evaluate on Y channel.")
-    parser.add_argument("--crop", type=int, default=0, help="Border crop in pixels.")
-    parser.add_argument("--device", default=None, help="Device override (cpu, cuda, mps, ...).")
-    return parser.parse_args()
+class EvalConfig:
+    __slots__ = (
+        "config_path",
+        "config",
+        "model_cfg",
+        "degradation_cfg",
+        "paths",
+        "model_specs",
+        "out_root",
+        "dump_count",
+        "use_y",
+        "crop_border",
+        "device",
+        "lpips_enabled",
+        "lpips_net",
+        "tta_enabled",
+    )
+
+    def __init__(self):
+        parser = argparse.ArgumentParser(description="Evaluate one or more EDSR checkpoints.")
+        parser.add_argument("--config", required=True, help="Path to YAML config.")
+        parser.add_argument("--models", nargs="+", required=True, help="label=ckpt.pth or ckpt.pth entries.")
+        parser.add_argument("--out", default="eval_out", help="Output directory.")
+        parser.add_argument("--dump", type=int, default=4, help="Number of example strips per model.")
+        parser.add_argument("--y", action="store_true", help="Evaluate on Y channel.")
+        parser.add_argument("--crop", type=int, default=0, help="Border crop in pixels.")
+        parser.add_argument("--device", default=None, help="Device override (cpu, cuda, mps, ...).")
+        parser.add_argument("--no_lpips", action="store_true", help="Disable LPIPS metric.")
+        parser.add_argument("--lpips_net", default="alex", help="LPIPS backbone (alex, vgg, squeeze).")
+        args = parser.parse_args()
+
+        self.config_path = Path(args.config)
+        self.config = yaml.safe_load(self.config_path.read_text())
+        self.model_cfg = self.config["model"]
+        self.degradation_cfg = DegradationConfig(**self.config["degradations"])
+        self.paths = resolve_eval_paths(self.config)
+        self.model_specs = parse_model_specs(args.models)
+        self.out_root = Path(args.out)
+        self.out_root.mkdir(parents=True, exist_ok=True)
+        self.dump_count = max(0, int(args.dump))
+        self.use_y = bool(args.y)
+        self.crop_border = max(0, int(args.crop))
+        self.device = pick_device(args.device)
+        self.lpips_enabled = not bool(args.no_lpips)
+        self.lpips_net = args.lpips_net
+        eval_cfg = self.config.get("eval", {})
+        self.tta_enabled = bool(eval_cfg.get("tta", True))
 
 
 def parse_model_specs(items):
@@ -53,21 +115,34 @@ def parse_model_specs(items):
         else:
             ckpt = t
             label = Path(ckpt).stem
+        prefixes = []
+        while True:
+            parts = ckpt.split(":", 1)
+            if len(parts) == 1:
+                break
+            prefix, remainder = parts
+            if prefix in {"twopass", "ema", "swa", "raw"}:
+                prefixes.append(prefix)
+                ckpt = remainder
+            else:
+                break
         mode = "normal"
-        if ckpt.startswith("twopass:"):
-            mode = "twopass"
-            ckpt = ckpt[len("twopass:"):]
+        variant = "model"
+        for prefix in prefixes:
+            if prefix == "twopass":
+                mode = "twopass"
+            elif prefix == "ema":
+                variant = "ema"
+            elif prefix == "swa":
+                variant = "swa"
+            elif prefix == "raw":
+                variant = "model"
         if not label:
             label = Path(ckpt).stem
-        specs.append((label, Path(ckpt), mode))
+        specs.append((label, Path(ckpt), mode, variant))
     return specs
 
     
-
-
-def load_config(path):
-    config_path = Path(path)
-    return yaml.safe_load(config_path.read_text())
 
 
 def _tensor_mapping(candidate):
@@ -85,6 +160,77 @@ def _select_state_dict(state):
         if _tensor_mapping(state):
             return state
     return state
+
+
+def _apply_residual_output(sr, lr, scale, enabled):
+    if not enabled or scale <= 1:
+        return sr
+    target_h = lr.shape[-2] * scale
+    target_w = lr.shape[-1] * scale
+    base = F.interpolate(lr, size=(target_h, target_w), mode="nearest")
+    return sr + base
+
+
+def _apply_transform(tensor, transpose, flip_h, flip_v):
+    out = tensor
+    if transpose:
+        out = out.transpose(-2, -1)
+    if flip_h:
+        out = out.flip(-1)
+    if flip_v:
+        out = out.flip(-2)
+    return out
+
+
+def _inverse_transform(tensor, transpose, flip_h, flip_v):
+    out = tensor
+    if flip_v:
+        out = out.flip(-2)
+    if flip_h:
+        out = out.flip(-1)
+    if transpose:
+        out = out.transpose(-2, -1)
+    return out
+
+
+def compute_grad_l1(sr, hr):
+    sr_y = to_y_channel(sr).float()
+    hr_y = to_y_channel(hr).float()
+    kx = _SOBEL_KERNEL_X.to(device=sr_y.device, dtype=torch.float32)
+    ky = _SOBEL_KERNEL_Y.to(device=sr_y.device, dtype=torch.float32)
+    grad_sr_x = F.conv2d(sr_y, kx, padding=1)
+    grad_hr_x = F.conv2d(hr_y, kx, padding=1)
+    grad_sr_y = F.conv2d(sr_y, ky, padding=1)
+    grad_hr_y = F.conv2d(hr_y, ky, padding=1)
+    diff = torch.abs(grad_sr_x - grad_hr_x) + torch.abs(grad_sr_y - grad_hr_y)
+    return diff.mean().item()
+
+
+def run_inference(model, lr, scale, residual_enabled, tta_enabled, mode):
+    def single_pass(inp):
+        out = model(inp)
+        return _apply_residual_output(out, inp, scale, residual_enabled)
+
+    def forward(inp):
+        if mode == "twopass":
+            mid = single_pass(inp).clamp(0.0, 1.0)
+            return single_pass(mid)
+        return single_pass(inp)
+
+    sr = forward(lr)
+    if not tta_enabled:
+        return sr.clamp(0.0, 1.0)
+
+    outputs = []
+    for transpose in (False, True):
+        for flip_h in (False, True):
+            for flip_v in (False, True):
+                aug = _apply_transform(lr, transpose, flip_h, flip_v)
+                pred = forward(aug)
+                pred = _inverse_transform(pred, transpose, flip_h, flip_v)
+                outputs.append(pred)
+    stacked = torch.stack(outputs, dim=0).mean(dim=0)
+    return stacked.clamp(0.0, 1.0)
 
 
 def resolve_eval_paths(config):
@@ -107,9 +253,17 @@ def build_model(model_cfg, device):
     return model
 
 
-def load_checkpoint(model, ckpt_path):
-    state = torch.load(ckpt_path, map_location="cpu")
-    state_dict = _select_state_dict(state)
+def load_checkpoint(model, ckpt_path, variant, state=None):
+    if state is None:
+        state = _safe_torch_load(ckpt_path)
+    if variant == "ema" and isinstance(state, dict) and "ema_state" in state:
+        state_dict = state["ema_state"]
+    elif variant == "swa" and isinstance(state, dict) and "swa_state" in state:
+        state_dict = state["swa_state"]
+    else:
+        state_dict = _select_state_dict(state)
+        if variant in ("ema", "swa"):
+            print(f"warning: checkpoint {ckpt_path} missing {variant} weights, using base model state")
     if hasattr(state_dict, "items"):
         cleaned = {}
         for key, value in state_dict.items():
@@ -119,7 +273,14 @@ def load_checkpoint(model, ckpt_path):
                     name = name[len(prefix):]
             cleaned[name] = value
         state_dict = cleaned
+        model_state = model.state_dict()
+        adapted, _ = extract_adapted_weights(state_dict, model_state, allow_tail=True)
+        if adapted:
+            model_state.update(adapted)
+            model.load_state_dict(model_state, strict=True)
+            return state
     model.load_state_dict(state_dict, strict=True)
+    return state
 
 def _clean_state_dict(state_dict):
     cleaned = {}
@@ -156,17 +317,6 @@ def crop_border_tensor(tensor, border):
     return tensor[..., border:h - border, border:w - border]
 
 
-def to_y_channel(tensor):
-    if tensor.size(1) == 1:
-        return tensor
-    if tensor.size(1) != 3:
-        return tensor
-    r = tensor[:, 0:1]
-    g = tensor[:, 1:2]
-    b = tensor[:, 2:3]
-    return 0.257 * r + 0.504 * g + 0.098 * b + 16.0 / 255.0
-
-
 def compute_psnr(sr, hr):
     return peak_signal_noise_ratio(sr, hr, data_range=1.0).item()
 
@@ -184,20 +334,46 @@ def compute_ssim(sr, hr):
     return value.item()
 
 
+def compute_l1(sr, hr):
+    return torch.abs(sr - hr).mean().item()
+
+
+def build_lpips(net, device):
+    import lpips
+
+    model = lpips.LPIPS(net=net).to(device)
+    model.eval()
+    for param in model.parameters():
+        param.requires_grad = False
+    return model
+
+
+def compute_lpips(sr, hr, model):
+    if model is None:
+        return None
+    if sr.size(1) != 3 or hr.size(1) != 3:
+        return None
+    sr_lp = sr.mul(2.0).sub(1.0)
+    hr_lp = hr.mul(2.0).sub(1.0)
+    value = model(sr_lp, hr_lp)
+    return value.mean().item()
+
+
 def save_example_strip(path, hr_tensor, lr_tensor, sr_tensor):
     path.parent.mkdir(parents=True, exist_ok=True)
     hr_cpu = hr_tensor.detach().cpu()
     lr_cpu = lr_tensor.detach().cpu()
     sr_cpu = sr_tensor.detach().cpu()
     target_size = hr_cpu.shape[-2:]
-    lr_up = F.interpolate(lr_cpu, size=target_size, mode="bicubic", align_corners=False)
-    strip = torch.cat([hr_cpu, lr_up, sr_cpu], dim=-1)
+    lr_nearest = F.interpolate(lr_cpu, size=target_size, mode="nearest")
+    lr_bicubic = F.interpolate(lr_cpu, size=target_size, mode="bicubic", align_corners=False)
+    strip = torch.cat([hr_cpu, lr_nearest, lr_bicubic, sr_cpu], dim=-1)
     array = strip.squeeze(0).permute(1, 2, 0).clamp(0.0, 1.0).numpy()
     plt.imsave(path.as_posix(), array)
 
 
 def write_metrics_csv(path, rows):
-    fieldnames = ["image", "psnr", "ssim"]
+    fieldnames = ["image", "psnr", "ssim", "l1", "lpips", "grad_l1"]
     with path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
@@ -207,6 +383,9 @@ def write_metrics_csv(path, rows):
                     "image": row["image"],
                     "psnr": f"{row['psnr']:.6f}",
                     "ssim": "" if row["ssim"] is None else f"{row['ssim']:.6f}",
+                    "l1": f"{row['l1']:.6f}",
+                    "lpips": "" if row["lpips"] is None else f"{row['lpips']:.6f}",
+                    "grad_l1": f"{row['grad_l1']:.6f}",
                 }
             )
 
@@ -214,7 +393,7 @@ def write_metrics_csv(path, rows):
 def write_summary_files(out_dir, summaries):
     summary_csv = out_dir / "summary.csv"
     summary_json = out_dir / "summary.json"
-    fieldnames = ["label", "psnr", "ssim", "count"]
+    fieldnames = ["label", "psnr", "ssim", "l1", "lpips", "grad_l1", "count"]
     with summary_csv.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
@@ -225,6 +404,9 @@ def write_summary_files(out_dir, summaries):
                     "label": row["label"],
                     "psnr": f"{row['psnr']:.6f}",
                     "ssim": ssim_str,
+                    "l1": f"{row['l1']:.6f}",
+                    "lpips": "" if math.isnan(row["lpips"]) else f"{row['lpips']:.6f}",
+                    "grad_l1": f"{row['grad_l1']:.6f}",
                     "count": row["count"],
                 }
             )
@@ -235,6 +417,9 @@ def write_summary_files(out_dir, summaries):
                 "label": row["label"],
                 "psnr": round(row["psnr"], 6),
                 "ssim": None if math.isnan(row["ssim"]) else round(row["ssim"], 6),
+                "l1": round(row["l1"], 6),
+                "lpips": None if math.isnan(row["lpips"]) else round(row["lpips"], 6),
+                "grad_l1": round(row["grad_l1"], 6),
                 "count": row["count"],
             }
         )
@@ -242,6 +427,9 @@ def write_summary_files(out_dir, summaries):
 
 
 def make_bar_chart(out_path, summaries, key, title, ylabel):
+    if not _HAVE_MPL:
+        print(f"[eval] matplotlib unavailable, skipping {out_path.name}")
+        return
     if not summaries:
         return
     labels = [row["label"] for row in summaries]
@@ -275,11 +463,23 @@ def make_bar_chart(out_path, summaries, key, title, ylabel):
     plt.close(fig)
 
 
-def evaluate_model(label, ckpt_path, model_cfg, degradation_cfg, paths, device,
-                   out_root, use_y, crop_border, dump_count, mode="normal"):
-
-    # load ckpt/config (unchanged) ...
-    state = torch.load(ckpt_path, map_location="cpu")
+def evaluate_model(
+    label,
+    ckpt_path,
+    model_cfg,
+    degradation_cfg,
+    paths,
+    device,
+    out_root,
+    use_y,
+    crop_border,
+    dump_count,
+    lpips_model,
+    mode="normal",
+    tta_enabled=True,
+    variant="model",
+):
+    state = _safe_torch_load(ckpt_path)
     ckpt_model_cfg = None
     if isinstance(state, dict):
         cfg = state.get("config")
@@ -287,17 +487,15 @@ def evaluate_model(label, ckpt_path, model_cfg, degradation_cfg, paths, device,
             ckpt_model_cfg = cfg.get("model")
 
     model_cfg_local = ckpt_model_cfg or model_cfg
-    model = build_model(model_cfg_local, device)  # this will be x2 for base, x4 for x4 ckpts
-
-    state_dict = _select_state_dict(state)
-    if hasattr(state_dict, "items"):
-        state_dict = _clean_state_dict(state_dict)
-    model.load_state_dict(state_dict, strict=True)
+    residual_enabled = bool(model_cfg_local.get("residual_output", False))
+    model = build_model(model_cfg_local, device)
+    load_checkpoint(model, ckpt_path, variant, state=state)
 
     model_dir = (Path(out_root) / label)
     model_dir.mkdir(parents=True, exist_ok=True)
 
     metrics_rows, psnr_values, ssim_values = [], [], []
+    l1_values, lpips_values, grad_values = [], [], []
     net_scale = int(model_cfg_local["scale"])
     if mode == "twopass" and net_scale != 2:
         raise ValueError(f"twopass expects a ×2 model, got ×{net_scale}")
@@ -310,12 +508,7 @@ def evaluate_model(label, ckpt_path, model_cfg, degradation_cfg, paths, device,
             lr = downscale_with_profile(hr_image, degrade_scale, degradation_cfg, rng).unsqueeze(0).to(device)
             hr = tensor_from_pil(hr_image).unsqueeze(0).to(device)
 
-            if mode == "twopass":
-                # x2 model run twice to get x4
-                mid = model(lr).clamp(0.0, 1.0)
-                sr  = model(mid).clamp(0.0, 1.0)
-            else:
-                sr  = model(lr).clamp(0.0, 1.0)
+            sr = run_inference(model, lr, net_scale, residual_enabled, tta_enabled, mode)
 
             sr_aligned, hr_aligned = center_crop_to_match(sr, hr)
             sr_eval = crop_border_tensor(sr_aligned, crop_border)
@@ -326,11 +519,18 @@ def evaluate_model(label, ckpt_path, model_cfg, degradation_cfg, paths, device,
 
             p = compute_psnr(sr_metric, hr_metric)
             s = compute_ssim(sr_metric, hr_metric)
+            l1 = compute_l1(sr_metric, hr_metric)
+            lp = compute_lpips(sr_eval, hr_eval, lpips_model)
+            g = compute_grad_l1(sr_eval, hr_eval)
 
-            metrics_rows.append({"image": str(path), "psnr": p, "ssim": s})
+            metrics_rows.append({"image": str(path), "psnr": p, "ssim": s, "l1": l1, "lpips": lp, "grad_l1": g})
             psnr_values.append(p)
             if s is not None:
                 ssim_values.append(s)
+            l1_values.append(l1)
+            if lp is not None:
+                lpips_values.append(lp)
+            grad_values.append(g)
 
             if idx < dump_count:
                 save_example_strip(model_dir / "examples" / f"{idx:04d}.png", hr_aligned, lr, sr_aligned)
@@ -338,39 +538,52 @@ def evaluate_model(label, ckpt_path, model_cfg, degradation_cfg, paths, device,
     write_metrics_csv(model_dir / "metrics.csv", metrics_rows)
     mean_psnr = sum(psnr_values) / len(psnr_values)
     mean_ssim = float("nan") if not ssim_values else sum(ssim_values) / len(ssim_values)
-    return {"label": label, "psnr": mean_psnr, "ssim": mean_ssim, "count": len(paths)}
+    mean_l1 = sum(l1_values) / len(l1_values)
+    mean_lpips = float("nan") if not lpips_values else sum(lpips_values) / len(lpips_values)
+    mean_grad = sum(grad_values) / len(grad_values)
+    return {
+        "label": label,
+        "psnr": mean_psnr,
+        "ssim": mean_ssim,
+        "l1": mean_l1,
+        "lpips": mean_lpips,
+        "grad_l1": mean_grad,
+        "count": len(paths),
+    }
 
-def main():
-    args = parse_args()
-    dump_count = max(0, args.dump)
-    crop_border = max(0, args.crop)
-    config = load_config(args.config)
-    model_cfg = config["model"]
-    degradation_cfg = DegradationConfig(**config["degradations"])
-    paths = resolve_eval_paths(config)
-    device = pick_device(args.device)
-    out_root = Path(args.out)
-    out_root.mkdir(parents=True, exist_ok=True)
-    model_specs = parse_model_specs(args.models)
+
+def run(config):
+    lpips_model = None
+    if config.lpips_enabled:
+        lpips_model = build_lpips(config.lpips_net, config.device)
     summaries = []
-    for label, ckpt_path, mode in model_specs:
+    for label, ckpt_path, mode, variant in config.model_specs:
         summary = evaluate_model(
             label=label,
             ckpt_path=ckpt_path,
-            model_cfg=model_cfg,
-            degradation_cfg=degradation_cfg,
-            paths=paths,
-            device=device,
-            out_root=out_root,
-            use_y=args.y,
-            crop_border=crop_border,
-            dump_count=dump_count,
-            mode=mode,   # <- add this
+            model_cfg=config.model_cfg,
+            degradation_cfg=config.degradation_cfg,
+            paths=config.paths,
+            device=config.device,
+            out_root=config.out_root,
+            use_y=config.use_y,
+            crop_border=config.crop_border,
+            dump_count=config.dump_count,
+            lpips_model=lpips_model,
+            mode=mode,
+            tta_enabled=config.tta_enabled,
+            variant=variant,
         )
         summaries.append(summary)
-    write_summary_files(out_root, summaries)
-    make_bar_chart(out_root / "bar_psnr.png", summaries, "psnr", "PSNR", "PSNR (dB)")
-    make_bar_chart(out_root / "bar_ssim.png", summaries, "ssim", "SSIM", "SSIM")
+    write_summary_files(config.out_root, summaries)
+    make_bar_chart(config.out_root / "bar_psnr.png", summaries, "psnr", "PSNR", "PSNR (dB)")
+    make_bar_chart(config.out_root / "bar_ssim.png", summaries, "ssim", "SSIM", "SSIM")
+    make_bar_chart(config.out_root / "bar_l1.png", summaries, "l1", "L1", "L1 (lower better)")
+    make_bar_chart(config.out_root / "bar_lpips.png", summaries, "lpips", "LPIPS", "LPIPS (lower better)")
+
+
+def main():
+    run(EvalConfig())
 
 
 if __name__ == "__main__":

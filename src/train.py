@@ -1,574 +1,360 @@
-import argparse
-import inspect
-import random
-from contextlib import nullcontext
-from pathlib import Path
+import math
 
-import numpy as np
 import torch
-import torch.nn.functional as F
+from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-import yaml
 
-
-from src.utils.seed import set_seed
-from src.models import EDSR
-from src.data import PixelArtDataset, DegradationConfig
-from src.data.utils import auto_split_paths, read_split_file
-from torchmetrics.functional.image import structural_similarity_index_measure
-
-_WORKER_BASE_SEED = 0
-_TORCH_LOAD_SUPPORTS_WEIGHTS_ONLY = "weights_only" in inspect.signature(torch.load).parameters
-
-def _safe_torch_load(path, *, weights_only=False):
-    load_kwargs = {"map_location": "cpu"}
-    if weights_only and _TORCH_LOAD_SUPPORTS_WEIGHTS_ONLY:
-        load_kwargs["weights_only"] = True
-    return torch.load(path, **load_kwargs)
-
-
-def set_worker_seed_base(seed):
-    global _WORKER_BASE_SEED
-    _WORKER_BASE_SEED = seed
-
-
-def worker_seed_init(worker_id):
-    worker_seed = (_WORKER_BASE_SEED + worker_id) % 2**32
-    np.random.seed(worker_seed)
-    random.seed(worker_seed)
-    torch.manual_seed(worker_seed)
-
-def _adapt_pretrained_key(key):
-    for pref in ("module.", "model.", "_orig_mod."):
-        if key.startswith(pref):
-            key = key[len(pref):]
-
-    if key.startswith("sub_mean") or key.startswith("add_mean"):
-        return None
-
-    if key.startswith("head.0."):
-        return "head." + key[len("head.0."):]
-
-    if key.startswith("body."):
-        parts = key.split(".")
-        if len(parts) >= 4:
-            block_idx = parts[1]
-            layer = parts[2]
-            remainder = ".".join(parts[3:])
-            if layer == "0":
-                base = f"body.{block_idx}.conv1"
-                return f"{base}.{remainder}" if remainder else base
-            if layer == "2":
-                base = f"body.{block_idx}.conv2"
-                return f"{base}.{remainder}" if remainder else base
-            return key
-
-    if key.startswith("body_conv"):
-        return key
-
-    if key.startswith("tail.0.0."):
-        return "tail.0." + key[len("tail.0.0."):]
-    if key.startswith("tail.1."):
-        return "tail.2." + key[len("tail.1."):]
-
-    if key.startswith("tail.") or key.startswith("head."):
-        return key
-
-    return key
-
-
-def _extract_adapted_weights(state_dict, model_state, allow_tail=True):
-    adapted = {}
-    matched_tail = set()
-    for raw_key, tensor in state_dict.items():
-        candidate_keys = []
-        if raw_key in model_state:
-            candidate_keys.append(raw_key)
-        new_key = _adapt_pretrained_key(raw_key)
-        if new_key is not None and new_key not in candidate_keys:
-            candidate_keys.append(new_key)
-        for key in candidate_keys:
-            is_tail = key.startswith("tail.")
-            if is_tail:
-                if not allow_tail:
-                    continue
-            if key not in model_state:
-                continue
-            if model_state[key].shape != tensor.shape:
-                continue
-            adapted[key] = tensor
-            if is_tail:
-                matched_tail.add(key)
-            break
-    return adapted, matched_tail
-
-
-
-def pick_device(preferred=None):
-    if preferred:
-        return torch.device(preferred)
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
+from src.data.degradations import generate_lr_from_hr_batch
+from src.training import apply_residual_output, damp_optimizer_moments, unwrap_model
+from src.training.augment import apply_gpu_augmentations
+from src.training.distill import DistillationHelper
+from src.training.session import TrainConfig, build_training_state, shutdown_manager
+from src.training.validation import validate
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", required=True)
-    parser.add_argument("--resume_from", default=None)
-    parser.add_argument(
-        "--pilot",
-        action="store_true",
-        help="Enable pilot mode by capping training steps for quick sweeps.",
-    )
-    args = parser.parse_args()
-
-    config_path = Path(args.config)
-    config = yaml.safe_load(config_path.read_text())
-
-    resume_state = None
-    start_step = 0
-    best_psnr = None
-    pilot_mode = bool(args.pilot)
-
-    training_cfg = config["training"]
-    tail_only = bool(training_cfg.get("tail_only", True))
-    seed = config.get("seed", 42)
-    set_seed(seed)
-    if torch.cuda.is_available():
-        torch.set_float32_matmul_precision("high")
-    set_worker_seed_base(seed)
-
-    device = pick_device()
-    print(f"training on {device}")
-    model_cfg = config["model"]
-    model = EDSR(
-        scale=model_cfg["scale"],
-        n_feats=model_cfg["n_feats"],
-        n_resblocks=model_cfg["n_resblocks"],
-        res_scale=model_cfg["res_scale"],
-    ).to(device)
-
-    degradation_cfg = DegradationConfig(**config["degradations"])
-
-    data_cfg = config["data"]
-
-    auto_root = data_cfg.get("root")
-    ratios = data_cfg.get("auto_split_ratio", {"train": 0.8, "val": 0.1, "test": 0.1})
-    split_seed = data_cfg.get("auto_split_seed", seed)
-    if auto_root:
-        splits = auto_split_paths(auto_root, ratios, split_seed)
-        train_paths = splits["train"]
-        val_paths = splits["val"]
-    else:
-        train_source = data_cfg.get("train_split")
-        val_source = data_cfg.get("val_split")
-        if not train_source or not val_source:
-            raise RuntimeError("train_split and val_split must be set when data.root is not defined")
-        train_paths = read_split_file(train_source)
-        val_paths = read_split_file(val_source)
-
-    cache_images = data_cfg.get("cache_images", True)
-    val_cache_images = data_cfg.get("val_cache_images", cache_images)
-
-    train_dataset = PixelArtDataset(
-        paths=train_paths,
-        scale=model_cfg["scale"],
-        patch_size_hr=data_cfg["patch_size_hr"],
-        degradation_config=degradation_cfg,
-        crops_tile_aligned_prob=data_cfg["crops_tile_aligned_prob"],
-        flips=data_cfg["flips"],
-        rotations=data_cfg["rotations"],
-        augment=True,
-        cache_images=cache_images,
-    )
-    val_dataset = PixelArtDataset(
-        paths=val_paths,
-        scale=model_cfg["scale"],
-        patch_size_hr=data_cfg.get("val_patch_size_hr"),
-        degradation_config=degradation_cfg,
-        crops_tile_aligned_prob=1.0,
-        flips=False,
-        rotations=False,
-        augment=False,
-        cache_images=val_cache_images,
-    )
-
-    pin_memory = device.type == "cuda"
-
-    train_workers = data_cfg.get("train_workers", 4)
-    val_workers = data_cfg.get("val_workers", 2)
-
-    train_loader_kwargs = dict(
-        dataset=train_dataset,
-        batch_size=config["training"]["batch_size"],
-        shuffle=True,
-        num_workers=train_workers,
-        pin_memory=pin_memory,
-        drop_last=True,
-        worker_init_fn=worker_seed_init,
-    )
-    if train_workers > 0:
-        train_loader_kwargs["prefetch_factor"] = data_cfg.get("prefetch_factor", 2)
-        train_loader_kwargs["persistent_workers"] = data_cfg.get("persistent_workers", True)
-
-    val_loader_kwargs = dict(
-        dataset=val_dataset,
-        batch_size=data_cfg.get("val_batch_size", 1),
-        shuffle=False,
-        num_workers=val_workers,
-        pin_memory=pin_memory,
-        drop_last=False,
-        worker_init_fn=worker_seed_init,
-    )
-    if val_workers > 0:
-        val_prefetch = data_cfg.get("val_prefetch_factor")
-        if val_prefetch is None:
-            val_prefetch = max(1, data_cfg.get("prefetch_factor", 2) // 2)
-        val_loader_kwargs["prefetch_factor"] = val_prefetch
-        val_loader_kwargs["persistent_workers"] = data_cfg.get("val_persistent_workers", False)
-
-    train_loader = DataLoader(**train_loader_kwargs)
-    val_loader = DataLoader(**val_loader_kwargs)
-
-    resume_path = args.resume_from
-    if resume_path and Path(resume_path).is_file():
-        # Safe load and adapt keys from compiled/wrapped checkpoints
-        resume_state = _safe_torch_load(resume_path, weights_only=True)
-        raw_state = resume_state.get("model", resume_state)
-        model_state = model.state_dict()
-        adapted, _ = _extract_adapted_weights(raw_state, model_state, allow_tail=True)
-
-        if not adapted:
-            raise RuntimeError(f"no compatible tensors when resuming from {resume_path}")
-        model_state.update(adapted)
-        model.load_state_dict(model_state, strict=True)
-        start_step = int(resume_state.get("step", 0))
-        start_step = int(resume_state.get("step", 0))
-
-    # Decide whether to inherit best_psnr from the checkpoint
-    best_psnr = None
-    if resume_state and "best_psnr" in resume_state:
-        resume_cfg = resume_state.get("config", {})
-        same_scale = resume_cfg.get("model", {}).get("scale") == config["model"]["scale"]
-        same_crop  = (resume_cfg.get("eval", {}).get("crop_border", 0)
-                    == config.get("eval", {}).get("crop_border", 0))
-        same_ychan = bool(resume_cfg.get("eval", {}).get("y_channel", False)) \
-                    == bool(config.get("eval", {}).get("y_channel", False))
-        # Optional: also require same output_dir to be extra safe
-        same_out = resume_cfg.get("output_dir") == config.get("output_dir")
-
-        if same_scale and same_crop and same_ychan and same_out:
-            best_psnr = float(resume_state["best_psnr"])
-            print(f"[resume] inheriting best_psnr={best_psnr:.4f}")
-        else:
-            print("[resume] resetting best_psnr for new run/config (scale/eval/output changed).")
-    else:
-        pretrained_path = config.get("pretrained_path")
-        if pretrained_path and Path(pretrained_path).is_file():
-            loaded = _safe_torch_load(pretrained_path, weights_only=True)
-            state_dict = loaded["model"] if "model" in loaded else loaded
-            model_state = model.state_dict()
-            adapted, matched_tail = _extract_adapted_weights(
-                state_dict, model_state, allow_tail=True
-            )
-            if adapted:
-                model_state.update(adapted)
-                model.load_state_dict(model_state, strict=True)
-            tail_status = "tail included" if matched_tail else "tail skipped"
-            print(f"warm start matched {len(adapted)} tensors ({tail_status})")
-        else:
-            print("training from scratch")
-
-    baseline_path = config.get("baseline_path")
-    if baseline_path and Path(baseline_path).is_file():
-        loaded = _safe_torch_load(baseline_path, weights_only=True)
-        baseline_state = loaded["model"] if "model" in loaded else loaded
-        baseline_model = EDSR(
-            scale=model_cfg["scale"],
-            n_feats=model_cfg["n_feats"],
-            n_resblocks=model_cfg["n_resblocks"],
-            res_scale=model_cfg["res_scale"],
-        ).to(device)
-        baseline_model_state = baseline_model.state_dict()
-        adapted_baseline, _ = _extract_adapted_weights(
-            baseline_state, baseline_model_state, allow_tail=True
-        )
-        if not adapted_baseline:
-            print(f"skipped baseline check, no compatible tensors in {baseline_path}")
-        else:
-            print(f"baseline matched {len(adapted_baseline)} tensors (include tail)")
-            adapted_keys = set(adapted_baseline.keys())
-            tail_keys = {key for key in baseline_model_state.keys() if key.startswith("tail.")}
-            missing_tail = tail_keys - adapted_keys
-            if tail_keys and missing_tail:
-                loaded_tail = len(tail_keys) - len(missing_tail)
-                print(
-                    f"skipped baseline check, only loaded {loaded_tail}/{len(tail_keys)} tail "
-                    f"tensors from {baseline_path}"
-                )
-            else:
-                baseline_model_state.update(adapted_baseline)
-                baseline_model.load_state_dict(baseline_model_state, strict=False)
-                b_l1, b_psnr, b_ssim = validate(baseline_model, val_loader, device, config)
-                print(
-                    f"baseline L1 {b_l1:.6f} | PSNR {b_psnr:.4f} | SSIM {b_ssim:.4f}"
-                )
+    cfg = TrainConfig()
+    state = build_training_state(cfg)
+    distiller = DistillationHelper(state)
+    try:
+        train_loop(state, distiller)
+    finally:
+        shutdown_manager(state)
+    finalize_training(state)
 
 
-    if config["training"].get("compile", False) and device.type == "cuda":
-        model = torch.compile(model)
-
-    opt_cfg = config["optimizer"]
-
-    # Split params
-    tail_param_ids = {id(p) for p in model.tail.parameters()}
-    trunk_params, tail_params = [], []
-    for _, param in model.named_parameters():
-        is_tail = id(param) in tail_param_ids
-        if tail_only:
-            param.requires_grad = is_tail
-        if not param.requires_grad:
-            continue
-        (tail_params if is_tail else trunk_params).append(param)
-
-    if tail_only and not tail_params:
-        raise RuntimeError("tail_only is true but no tail parameters were found")
-
-    # Build param groups with names so we can map back to target LR
-    param_groups = []
-    if not tail_only and trunk_params:
-        param_groups.append({"params": trunk_params, "lr": opt_cfg["lr_trunk"], "name": "trunk"})
-    if tail_params:
-        param_groups.append({"params": tail_params, "lr": opt_cfg["lr_tail"], "name": "tail"})
-    if not param_groups:
-        raise RuntimeError("No trainable parameters")
-
-    # Optimizer
-    opt_type = opt_cfg.get("type", "adamw").lower()
-    if opt_type == "adam":
-        optimizer = torch.optim.Adam(param_groups, weight_decay=opt_cfg.get("weight_decay", 0.0))
-    else:
-        optimizer = torch.optim.AdamW(param_groups, weight_decay=opt_cfg.get("weight_decay", 0.0))
-
-    # Target learning rates used for warmup (don’t depend on resume-time values)
-    name_to_target = {
-        "trunk": opt_cfg.get("lr_trunk", opt_cfg["lr_tail"]),
-        "tail":  opt_cfg["lr_tail"],
-    }
-    target_lrs = [name_to_target.get(g.get("name", "tail"), g["lr"]) for g in optimizer.param_groups]    
-
-    amp_enabled = training_cfg["amp"] and device.type == "cuda"
-    if amp_enabled:
-        # New API only (PyTorch >= 2.x)
-        scaler = torch.amp.GradScaler("cuda")  # positional "cuda", not device_type=...
-        autocast_context = lambda: torch.amp.autocast("cuda", dtype=torch.float16)
-    else:
-        scaler = None
-        autocast_context = nullcontext
-
-    # If resuming, load optimizer (and scaler) state before computing base_lrs
-    if resume_state is not None:
-        if "optimizer" in resume_state:
-            try:
-                optimizer.load_state_dict(resume_state["optimizer"])
-            except ValueError as e:
-                print(f"warning: could not load optimizer state: {e}")
-            else:
-                for state in optimizer.state.values():
-                    for k, v in list(state.items()):
-                        if isinstance(v, torch.Tensor):
-                            state[k] = v.to(device, non_blocking=True)
-        if amp_enabled and "scaler" in resume_state and resume_state["scaler"] is not None:
-            try:
-                scaler.load_state_dict(resume_state["scaler"])
-            except Exception as e:
-                print(f"warning: could not load AMP scaler state: {e}")
-
-    total_steps = training_cfg["steps"]
-    pilot_steps = training_cfg.get("pilot_steps")
-    if pilot_mode:
-        if pilot_steps is None:
-            pilot_steps = training_cfg.get("val_every", total_steps)
-        pilot_steps = max(int(pilot_steps), 1)
-        total_steps = min(total_steps, pilot_steps)
-        print(f"[pilot] limiting training to {total_steps} steps (pilot_steps={pilot_steps})")
-    warmup_steps = training_cfg.get("warmup_steps", 0)
-    warmup_start_factor = training_cfg.get("warmup_start_factor", 1e-3)
-    # compute base_lrs after any resume has potentially changed group LRs
-    base_lrs = target_lrs
-    default_dir = f"runs/edsr_x{model_cfg['scale']}"
-    output_dir = Path(config.get("output_dir", default_dir))
-    output_dir.mkdir(parents=True, exist_ok=True)
-    best_path = output_dir / "best.pth"
-
-    # Track resume status for LR warmup decisions
-    resume_step = start_step
-    resuming = resume_state is not None
-
-    model.train()
+def train_loop(state, distiller):
+    model = state.model
+    optimizer = state.optimizer
+    loss_computer = state.loss_computer
+    device = state.device
+    channels_last = state.channels_last
+    train_loader = state.train_loader
     train_iter = iter(train_loader)
-    progress = tqdm(range(start_step + 1, total_steps + 1), initial=start_step, total=total_steps)
-    for step in progress:
-        try:
-            lr_batch, hr_batch = next(train_iter)
-        except StopIteration:
-            train_iter = iter(train_loader)
-            lr_batch, hr_batch = next(train_iter)
 
-        lr_batch = lr_batch.to(device, non_blocking=True)
-        hr_batch = hr_batch.to(device, non_blocking=True)
+    def reset_train_iterator(full_restart=False):
+        nonlocal train_loader, train_iter
+        if full_restart:
+            old_loader = train_loader
+            train_loader = DataLoader(**state.train_loader_kwargs)
+            state.train_loader = train_loader
+            train_iter = iter(train_loader)
+            if old_loader is not None:
+                old_iter = getattr(old_loader, "_iterator", None)
+                if old_iter is not None:
+                    old_iter._shutdown_workers()
+        else:
+            train_iter = iter(train_loader)
+
+    def next_train_batch():
+        nonlocal train_iter
+        while True:
+            try:
+                return next(train_iter)
+            except StopIteration:
+                reset_train_iterator(full_restart=False)
+            except RuntimeError as err:
+                message = str(err)
+                if "stack expects each tensor to be equal size" in message:
+                    print("[loader] mixed tensor sizes detected; resetting train iterator")
+                    reset_train_iterator(full_restart=True)
+                    continue
+                raise
+
+    progress = tqdm(
+        range(state.start_step + 1, state.total_steps + 1),
+        initial=state.start_step,
+        total=state.total_steps,
+    )
+    residual_enabled = bool(state.model_cfg.get("residual_output", False))
+    current_patch = (
+        state.patch_schedule[state.patch_cursor][1]
+        if state.patch_schedule
+        else state.data_cfg.get("patch_size_hr")
+    )
+    if state.patch_ref is not None and current_patch is not None:
+        state.patch_ref.value = current_patch
+
+    for step in progress:
+        reset_loader = False
+        if state.mini_warmup_end is not None and step > state.mini_warmup_end:
+            state.mini_warmup_start = None
+            state.mini_warmup_end = None
+        if state.patch_ref is not None and state.patch_schedule:
+            while (
+                state.patch_cursor + 1 < len(state.patch_schedule)
+                and step >= state.patch_schedule[state.patch_cursor + 1][0]
+            ):
+                state.patch_cursor += 1
+                current_patch = state.patch_schedule[state.patch_cursor][1]
+                state.patch_ref.value = current_patch
+                print(f"[patch] step {step} patch_size={current_patch}")
+                if state.patch_mini_warmup_steps > 0:
+                    state.mini_warmup_start = step
+                    state.mini_warmup_end = step + state.patch_mini_warmup_steps
+                else:
+                    state.mini_warmup_start = None
+                    state.mini_warmup_end = None
+                damp_optimizer_moments(optimizer, 0.5)
+                reset_loader = True
+        if state.degrad_ref is not None and state.degrad_schedule:
+            while (
+                state.degrad_cursor + 1 < len(state.degrad_schedule)
+                and step >= state.degrad_schedule[state.degrad_cursor + 1][0]
+            ):
+                state.degrad_cursor += 1
+                state.degrad_ref.value = state.degrad_cursor
+                phase = state.train_degrad_configs[state.degrad_cursor]
+                print(f"[degrad] step {step} jpeg={phase.jpeg_prob:.2f} noise={phase.gaussian_noise_prob:.3f}")
+        if reset_loader:
+            reset_train_iterator(full_restart=True)
+
+        batch = next_train_batch()
+        if state.train_defer_degradation:
+            hr_batch, seed_batch = batch
+            hr_batch = hr_batch.to(device, non_blocking=True)
+            if channels_last:
+                hr_batch = hr_batch.to(memory_format=torch.channels_last)
+            seed_values = seed_batch.tolist() if hasattr(seed_batch, "tolist") else list(seed_batch)
+            hr_batch = apply_gpu_augmentations(
+                hr_batch,
+                seed_values,
+                bool(state.data_cfg.get("flips", True)),
+                bool(state.data_cfg.get("rotations", True)),
+            )
+            active_degrad_cfg = current_degradation_config(state)
+            lr_batch = generate_lr_from_hr_batch(
+                hr_batch,
+                state.model_cfg["scale"],
+                active_degrad_cfg,
+                seed_values,
+            )
+            if channels_last:
+                lr_batch = lr_batch.to(memory_format=torch.channels_last)
+        else:
+            lr_batch, hr_batch = batch
+            lr_batch = lr_batch.to(device, non_blocking=True)
+            hr_batch = hr_batch.to(device, non_blocking=True)
+            if channels_last:
+                lr_batch = lr_batch.to(memory_format=torch.channels_last)
+                hr_batch = hr_batch.to(memory_format=torch.channels_last)
 
         optimizer.zero_grad(set_to_none=True)
 
-        # Apply warmup only if not resuming past warmup. If we resumed during warmup,
-        # continue from the current step; otherwise preserve checkpoint LRs.
-        in_warmup = warmup_steps > 0 and step <= warmup_steps
-        resuming_past_warmup = resuming and (resume_step >= warmup_steps)
+        in_warmup = state.warmup_steps > 0 and step <= state.warmup_steps
+        resuming_past_warmup = state.resuming and (state.resume_step >= state.warmup_steps)
+        skip_lr_update = resuming_past_warmup and step == state.start_step + 1
+        if not skip_lr_update:
+            if in_warmup and not resuming_past_warmup:
+                progress_frac = step / state.warmup_steps if state.warmup_steps else 1.0
+                factor = state.warmup_start_factor + (1.0 - state.warmup_start_factor) * progress_frac
+                for lr, group in zip(state.base_lrs, optimizer.param_groups):
+                    group["lr"] = lr * factor
+            else:
+                scheduled = scheduled_lrs_for_step(state, step)
+                if (
+                    state.mini_warmup_end is not None
+                    and step <= state.mini_warmup_end
+                    and state.patch_mini_warmup_steps > 0
+                ):
+                    frac = (step - state.mini_warmup_start) / max(1, state.patch_mini_warmup_steps)
+                    frac = min(max(frac, 0.0), 1.0)
+                    factor = state.warmup_start_factor + (1.0 - state.warmup_start_factor) * frac
+                    scheduled = [lr * factor for lr in scheduled]
+                for lr_value, group in zip(scheduled, optimizer.param_groups):
+                    group["lr"] = lr_value
 
-        if in_warmup and not resuming_past_warmup:
-            progress_frac = step / warmup_steps
-            factor = warmup_start_factor + (1.0 - warmup_start_factor) * progress_frac
-            for lr, group in zip(base_lrs, optimizer.param_groups):
-                group["lr"] = lr * factor
-        elif warmup_steps > 0 and step == warmup_steps + 1 and not resuming_past_warmup:
-            # Ensure exact base LR at the first step after warmup (only when not resuming past warmup)
-            for lr, group in zip(base_lrs, optimizer.param_groups):
-                group["lr"] = lr
-        
-        if amp_enabled:
-            with autocast_context():
+        if state.amp_enabled:
+            with state.autocast_context():
                 sr_batch = model(lr_batch)
-                loss = F.mse_loss(sr_batch, hr_batch)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+                sr_batch = apply_residual_output(sr_batch, lr_batch, state.model_cfg["scale"], residual_enabled)
+                loss_value, loss_terms = loss_computer.compute(sr_batch, hr_batch, step)
+                loss_value, distill_weight = distiller.maybe_apply(
+                    step,
+                    lr_batch,
+                    sr_batch,
+                    loss_value,
+                    loss_terms,
+                    state.amp_enabled,
+                    state.autocast_context,
+                )
+            state.scaler.scale(loss_value).backward()
+            if state.grad_clip_enabled and state.grad_clip_max > 0.0:
+                state.scaler.unscale_(optimizer)
+                clip_grad_norm_(state.trainable_params, state.grad_clip_max)
+            state.scaler.step(optimizer)
+            state.scaler.update()
         else:
             sr_batch = model(lr_batch)
-            loss = F.mse_loss(sr_batch, hr_batch)
-            loss.backward()
+            sr_batch = apply_residual_output(sr_batch, lr_batch, state.model_cfg["scale"], residual_enabled)
+            loss_value, loss_terms = loss_computer.compute(sr_batch, hr_batch, step)
+            loss_value, distill_weight = distiller.maybe_apply(
+                step,
+                lr_batch,
+                sr_batch,
+                loss_value,
+                loss_terms,
+                state.amp_enabled,
+                state.autocast_context,
+            )
+            loss_value.backward()
+            if state.grad_clip_enabled and state.grad_clip_max > 0.0:
+                clip_grad_norm_(state.trainable_params, state.grad_clip_max)
             optimizer.step()
 
+        if state.ema_helper is not None:
+            state.ema_helper.update(unwrap_model(model))
+        if (
+            state.swa_helper is not None
+            and state.ema_helper is not None
+            and state.swa_start_step is not None
+            and state.swa_update_every
+            and step >= state.swa_start_step
+            and step % state.swa_update_every == 0
+        ):
+            state.swa_helper.update(state.ema_helper.model)
+
         if step % 50 == 0 or step == 1:
-            progress.set_description(f"step {step} loss {loss.item():.4f}")
+            loss_num = float(loss_value.detach())
+            comp_bits = ",".join(f"{k[:4]}={v:.3f}" for k, v in loss_terms.items())
+            lr_bits = ",".join(f"{g.get('name', 'pg')}={g['lr']:.2e}" for g in optimizer.param_groups)
+            postfix = {
+                "loss": f"{loss_num:.4f}",
+                "lr": lr_bits,
+                "patch": current_patch,
+                "distill": f"{distill_weight:.3f}",
+            }
+            progress.set_description(f"step {step} {comp_bits}")
+            progress.set_postfix(postfix)
 
-        if step % training_cfg["val_every"] == 0 or step == total_steps:
-            val_l1, val_psnr, val_ssim = validate(model, val_loader, device, config)
-            print(f"validation mean L1: {val_l1:.6f} | PSNR: {val_psnr:.4f} | SSIM: {val_ssim:.4f}")
+        perform_validation = step % state.training_cfg["val_every"] == 0 or step == state.total_steps
+        if perform_validation:
+            eval_model = state.ema_helper.model if state.ema_helper is not None else model
+            ema_label = "[val][ema]" if state.ema_helper is not None else "[val]"
+            val_l1, val_psnr, val_ssim = validate(
+                eval_model,
+                state.val_loader,
+                device,
+                state.config,
+                progress_label=ema_label,
+            )
+            if state.ema_helper is None:
+                print(f"validation mean L1: {val_l1:.6f} | PSNR: {val_psnr:.4f} | SSIM: {val_ssim:.4f}")
+            else:
+                final_eval = step == state.total_steps
+                if not final_eval:
+                    print(f"validation EMA L1 {val_l1:.6f} | PSNR {val_psnr:.4f} | SSIM {val_ssim:.4f}")
+                else:
+                    raw_l1, raw_psnr, raw_ssim = validate(
+                        model,
+                        state.val_loader,
+                        device,
+                        state.config,
+                        progress_label="[val][raw]",
+                    )
+                    print(
+                        f"validation EMA L1 {val_l1:.6f} | PSNR {val_psnr:.4f} | SSIM {val_ssim:.4f} || "
+                        f"raw L1 {raw_l1:.6f} | PSNR {raw_psnr:.4f} | SSIM {raw_ssim:.4f}"
+                    )
 
-            improved = best_psnr is None or val_psnr > best_psnr
+            improved = state.best_psnr is None or val_psnr > state.best_psnr + state.early_stop_min_delta
             if improved:
-                best_psnr = val_psnr
+                state.best_psnr = val_psnr
+                state.epochs_since_improve = 0
+            else:
+                state.epochs_since_improve += 1
 
-            base_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+            base_model = unwrap_model(model)
             to_save = {
-                "model": base_model.state_dict(),  # save unwrapped module
+                "model": base_model.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "step": step,
-                "best_psnr": best_psnr,
-                "config": config,
+                "best_psnr": state.best_psnr,
+                "epochs_since_improve": state.epochs_since_improve,
+                "config": state.config,
             }
-            if amp_enabled:
-                to_save["scaler"] = scaler.state_dict()
+            if state.ema_helper is not None:
+                to_save["ema_state"] = state.ema_helper.model.state_dict()
+                to_save["ema_updates"] = state.ema_helper.updates
+            if state.swa_helper is not None and state.swa_helper.has_samples():
+                to_save["swa_state"] = state.swa_helper.model.state_dict()
+                to_save["swa_samples"] = state.swa_helper.samples
+            if state.amp_enabled and state.scaler is not None:
+                to_save["scaler"] = state.scaler.state_dict()
 
-            # always write rolling last
-            last_path = output_dir / "last.pth"
+            last_path = state.output_dir / "last.pth"
             torch.save(to_save, last_path)
 
             if improved:
-                torch.save(to_save, best_path)
-                print(f"saved best PSNR: {val_psnr:.4f} → {best_path}")
+                torch.save(to_save, state.best_path)
+                print(f"saved best PSNR: {val_psnr:.4f} → {state.best_path}")
 
-def _align_spatial_dims(sr_batch, hr_batch):
-    # Ensure tensors share the same spatial extent before computing the loss.
-    sr_h, sr_w = sr_batch.shape[-2:]
-    hr_h, hr_w = hr_batch.shape[-2:]
-    target_h = min(sr_h, hr_h)
-    target_w = min(sr_w, hr_w)
-    if target_h <= 0 or target_w <= 0:
-        raise RuntimeError(
-            f"non-positive target size when aligning tensors: {(target_h, target_w)}"
-        )
-    if sr_h != target_h or sr_w != target_w:
-        sr_batch = sr_batch[..., :target_h, :target_w]
-    if hr_h != target_h or hr_w != target_w:
-        hr_batch = hr_batch[..., :target_h, :target_w]
-    return sr_batch, hr_batch
+            if state.early_stop_patience > 0 and state.epochs_since_improve >= state.early_stop_patience:
+                print(
+                    f"[early_stop] no PSNR improvement for {state.epochs_since_improve} validation runs, "
+                    f"stopping at step {step}"
+                )
+                break
 
 
-def _to_y(t):
-    if t.size(1) == 1:
-        return t
-    r, g, b = t[:, 0:1], t[:, 1:2], t[:, 2:3]
-    return 0.257 * r + 0.504 * g + 0.098 * b + 16.0 / 255.0
+def finalize_training(state):
+    if state.swa_helper is not None and state.swa_helper.has_samples():
+        swa_l1, swa_psnr, swa_ssim = validate(state.swa_helper.model, state.val_loader, state.device, state.config)
+        swa_payload = {
+            "model": state.swa_helper.model.state_dict(),
+            "config": state.config,
+            "swa_samples": state.swa_helper.samples,
+            "metrics": {"l1": swa_l1, "psnr": swa_psnr, "ssim": swa_ssim},
+        }
+        swa_path = state.output_dir / "final_swa.pth"
+        torch.save(swa_payload, swa_path)
+        print(f"[swa] L1 {swa_l1:.6f} | PSNR {swa_psnr:.4f} | SSIM {swa_ssim:.4f} → {swa_path}")
+        if state.best_psnr is None or swa_psnr > state.best_psnr + state.early_stop_min_delta:
+            state.best_psnr = swa_psnr
+            swa_state = state.swa_helper.model.state_dict()
+            best_payload = {
+                "model": swa_state,
+                "step": state.total_steps,
+                "best_psnr": state.best_psnr,
+                "epochs_since_improve": state.epochs_since_improve,
+                "config": state.config,
+                "swa_state": swa_state,
+                "swa_samples": state.swa_helper.samples,
+                "swa_promoted": True,
+            }
+            if state.ema_helper is not None:
+                best_payload["ema_state"] = state.ema_helper.model.state_dict()
+                best_payload["ema_updates"] = state.ema_helper.updates
+            torch.save(best_payload, state.best_path)
+            print(f"[swa] improved best checkpoint via SWA ({state.best_psnr:.4f}) → {state.best_path}")
 
 
-def validate(model, loader, device, config):
-    model.eval()
-    l1_total = 0.0
-    psnr_total = 0.0
-    ssim_total = 0.0
-    ssim_count = 0
-    count = 0
+def current_degradation_config(state):
+    configs = state.train_degrad_configs
+    if not configs:
+        return state.degradation_cfg
+    if state.degrad_ref is not None:
+        idx = int(state.degrad_ref.value)
+    else:
+        idx = state.degrad_cursor
+    idx = max(0, min(idx, len(configs) - 1))
+    return configs[idx]
 
-    eval_cfg = config.get("eval", {})
-    crop = int(eval_cfg.get("crop_border", 0) or 0)
-    use_y = bool(eval_cfg.get("y_channel", False))
 
-    with torch.no_grad():
-        for lr_batch, hr_batch in loader:
-            lr_batch = lr_batch.to(device, non_blocking=True)
-            hr_batch = hr_batch.to(device, non_blocking=True)
+def scheduled_lrs_for_step(state, step):
+    if state.scheduler_type != "cosine" or step <= state.warmup_steps:
+        return list(state.base_lrs)
+    denom = max(1, state.total_steps - state.warmup_steps)
+    progress = min(max((step - state.warmup_steps) / denom, 0.0), 1.0)
+    floor = state.min_lr_factor
+    if state.final_floor_factor != state.min_lr_factor and progress >= state.final_floor_start:
+        tail = (progress - state.final_floor_start) / max(1e-8, 1.0 - state.final_floor_start)
+        tail = min(max(tail, 0.0), 1.0)
+        floor = state.min_lr_factor + (state.final_floor_factor - state.min_lr_factor) * tail
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return [base * (floor + (1.0 - floor) * cosine) for base in state.base_lrs]
 
-            sr_batch = model(lr_batch)
-            if sr_batch.shape[-2:] != hr_batch.shape[-2:]:
-                sr_batch, hr_batch = _align_spatial_dims(sr_batch, hr_batch)
-
-            sr_batch = sr_batch.clamp_(0.0, 1.0)
-            hr_eval = hr_batch
-            sr_eval = sr_batch
-
-            if crop > 0:
-                sr_eval = sr_eval[:, :, crop:-crop, crop:-crop]
-                hr_eval = hr_eval[:, :, crop:-crop, crop:-crop]
-
-            sr_c = sr_eval
-            hr_c = hr_eval
-            if use_y:
-                sr_c = _to_y(sr_c)
-                hr_c = _to_y(hr_c)
-            n = sr_c.size(0)
-
-            # L1 per sample
-            l1_batch = F.l1_loss(sr_c, hr_c, reduction="none").flatten(1).mean(dim=1)
-            l1_total += l1_batch.sum().item()
-
-            # PSNR per sample
-            mse = ((sr_c - hr_c) ** 2).flatten(1).mean(dim=1).clamp_min(1e-10)
-            batch_psnr = 10.0 * torch.log10(1.0 / mse)
-            psnr_total += batch_psnr.sum().item()
-
-            # SSIM: guard tiny tiles (default kernel_size=11 needs h,w>=11). Use odd window <= min(h,w), skip if <3.
-            h, w = int(sr_c.shape[-2]), int(sr_c.shape[-1])
-            win = min(11, h, w)
-            if win >= 3:
-                if win % 2 == 0:
-                    win -= 1
-                ssim_batch = structural_similarity_index_measure(sr_c, hr_c, data_range=1.0, kernel_size=win)
-                ssim_total += float(ssim_batch) * n
-                ssim_count += n
-            # else: skip SSIM accumulation for this batch
-
-            count += n
-
-    model.train()
-    mean_l1 = l1_total / max(1, count)
-    mean_psnr = psnr_total / max(1, count)
-    mean_ssim = ssim_total / max(1, ssim_count)
-    return mean_l1, mean_psnr, mean_ssim
 
 if __name__ == "__main__":
     main()

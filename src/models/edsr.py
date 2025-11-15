@@ -16,23 +16,36 @@ class ResidualBlock(nn.Module):
         return x + residual * self.res_scale
 
 
+def build_tail(scale, n_feats, res_scale):
+    if scale == 2:
+        return nn.Sequential(
+            nn.Conv2d(n_feats, n_feats * 4, kernel_size=3, padding=1),
+            nn.PixelShuffle(2),
+            nn.Conv2d(n_feats, 3, kernel_size=3, padding=1),
+        )
+    if scale == 4:
+        layers = [
+            nn.Conv2d(n_feats, n_feats * 4, kernel_size=3, padding=1),
+            nn.PixelShuffle(2),
+            ResidualBlock(n_feats, res_scale),
+            nn.Conv2d(n_feats, n_feats * 4, kernel_size=3, padding=1),
+            nn.PixelShuffle(2),
+            nn.Conv2d(n_feats, 3, kernel_size=3, padding=1),
+        ]
+        return nn.Sequential(*layers)
+    raise ValueError("scale must be 2 or 4")
+
+
 class EDSR(nn.Module):
     def __init__(self, scale, n_feats, n_resblocks, res_scale):
         super().__init__()
-        if scale not in (2, 4):
-            raise ValueError("scale must be 2 or 4")
         self.head = nn.Conv2d(3, n_feats, kernel_size=3, padding=1)
         body = []
         for _ in range(n_resblocks):
             body.append(ResidualBlock(n_feats, res_scale))
         self.body = nn.Sequential(*body)
         self.body_conv = nn.Conv2d(n_feats, n_feats, kernel_size=3, padding=1)
-        tail_layers = [
-            nn.Conv2d(n_feats, n_feats * scale * scale, kernel_size=3, padding=1),
-            nn.PixelShuffle(scale),
-            nn.Conv2d(n_feats, 3, kernel_size=3, padding=1),
-        ]
-        self.tail = nn.Sequential(*tail_layers)
+        self.tail = build_tail(scale, n_feats, res_scale)
 
     def forward(self, x):
         features = self.head(x)

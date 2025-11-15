@@ -1,0 +1,131 @@
+model:
+  scale: 4
+  n_feats: 64
+  n_resblocks: 32
+  res_scale: 0.1
+  residual_output: true
+
+training:
+  steps: 400000
+  batch_size: 40
+  val_every: 2000
+  amp: true
+  compile: true
+  tail_only: true
+  warmup_steps: 8000
+  warmup_start_factor: 0.001
+  early_stop_patience: 0
+  early_stop_min_delta: 0.0
+  patch_mini_warmup_steps: 500
+  scheduler:
+    type: cosine
+    min_lr_factor: 1.0e-2
+    final_min_lr_factor: 5.0e-3
+    final_phase_start: 0.9
+  ema:
+    enabled: true
+    decay: 0.99995
+    update_every: 1
+  swa:
+    enabled: true
+    start_frac: 0.8
+    update_every: 5000
+  grad_clip:
+    enabled: true
+    max_norm: 1.0
+
+optimizer:
+  type: adam
+  lr_trunk: 0.0
+  lr_tail: 2.0e-4
+  weight_decay: 0.0
+
+loss:
+  y_only: true
+  charbonnier_eps: 0.001
+  schedule:
+    - step: 0
+      charbonnier: 1.0
+      rgb_l1: 0.0
+      grad: 0.10
+      lpips: 0.0
+      lpips_net: alex
+    - step: 0.8T
+      charbonnier: 1.0
+      rgb_l1: 0.0
+      grad: 0.10
+      lpips: 0.02
+      lpips_net: alex
+
+distillation:
+  enabled: false
+  teacher_path: runs/pxsr_x2_trunk/best.pth
+  teacher_twopass: true
+  start_frac: 0.6
+  final_frac: 0.9
+  weight_max: 0.10
+  weight_final: 0.12
+  sample_frac: 0.5
+
+degradations:
+  nearest_prob: 0.60
+  box_prob: 0.20
+  bilinear_prob: 0.15
+  tiny_blur_prob: 0.05
+  jpeg_prob: 0.0
+  jpeg_quality_min: 75
+  jpeg_quality_max: 95
+  palette_jitter_prob: 0.25
+  palette_jitter_std: 0.02
+  channel_drop_prob: 0.05
+  gaussian_noise_prob: 0.10
+  gaussian_noise_std: 0.005
+
+data:
+  root: null
+  train_split: data/splits_jpeg/train.txt
+  val_split: data/splits_jpeg/val.txt
+  test_split: data/splits_jpeg/test.txt
+  auto_split_seed: 42
+  auto_split_ratio: { train: 0.8, val: 0.1, test: 0.1 }
+  cache_images: true
+  val_cache_images: true
+  defer_degradation: true
+  patch_size_hr: 128
+  patch_schedule:
+    - { step: 0, size: 64 }
+    - { step: 133333, size: 96 }
+    - { step: 266666, size: 128 }
+    - { step: 360000, size: 160 }
+  val_patch_size_hr: 128
+  pt_cache_root: data/pt_cache
+  pt_cache_source_root: data
+  edge_metadata_root: data/edge_meta
+  edge_metadata_source_root: data
+  crops_tile_aligned_prob: 1.0
+  flips: true
+  rotations: true
+  val_batch_size: 8
+  train_workers: 8
+  val_workers: 4
+  prefetch_factor: 2
+  val_prefetch_factor: 2
+  persistent_workers: true
+  val_persistent_workers: true
+  edge_sampling:
+    enabled: true
+    candidates: 1
+    prefer_top_p: 0.6
+  degrad_schedule:
+    - { step: 0, jpeg_prob: 0.0, gaussian_noise_prob: 0.05 }
+    - { step: 0.6T, jpeg_prob: 0.0, gaussian_noise_prob: 0.10 }
+
+eval:
+  crop_border: 2
+  y_channel: true
+  tta: true
+  dump: 4
+
+pretrained_path: runs/pxsr_x2_trunk/best.pth
+output_dir: runs/pxsr_x4_tail
+seed: 42

@@ -9,11 +9,22 @@ outputs/
 runs/
 onnx/
 pretrained/
-data/cache/
+data/
 *.log
 *.ckpt
 *.pt
 *.pth
 .serena
+
+repomix-output.xml
+
+
+data/edge_meta/jpeg_aug
+data/edge_meta/raw
+data/jpeg_aug
+data/pt_cache
+data/splits
+data/splits_jpeg
+data/raw
 
 .ruff_cache/
