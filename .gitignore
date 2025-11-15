@@ -16,7 +16,7 @@ data/
 *.pth
 .serena
 
-repo_mix_output.xml
+repomix-output.xml
 
 
 data/edge_meta/jpeg_aug
